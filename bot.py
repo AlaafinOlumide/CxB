@@ -355,7 +355,7 @@ def bot_loop():
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📈 Pair: XAU/USD  |  Timeframe: 15m\n"
         "🔍 Scanning every 15 minutes\n"
-        "⚙️ Signals require 6/8 confluence factors\n"
+        "⚙️ Signals require 5/8 confluence factors\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "<i>Indicators: EMA21/50/200 · RSI · MACD · StochRSI · ATR</i>"
     )
