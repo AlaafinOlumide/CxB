@@ -33,7 +33,7 @@ CANDLES     = 100           # 1 API call per scan — well within free limits
 TP1_RATIO   = 1.5           # TP1 = 1.5× ATR from entry
 TP2_RATIO   = 3.0           # TP2 = 3.0× ATR from entry
 ATR_MULT    = 1.2           # SL = 1.2× ATR from entry
-THRESHOLD   = 6             # minimum score out of 8 to fire a signal
+THRESHOLD   = 5             # minimum score out of 8 to fire a signal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -268,7 +268,10 @@ def analyse(candles: list[dict]) -> dict | None:
 
     sl_dist = vatr * ATR_MULT
 
-    if sb >= THRESHOLD and sb > se:
+    bull_ema_aligned = v21 > v50 > v200
+    bear_ema_aligned = v21 < v50 < v200
+
+    if sb >= THRESHOLD and sb > se and bull_ema_aligned:
         entry = price
         return {
             "direction": "BUY",
@@ -283,7 +286,7 @@ def analyse(candles: list[dict]) -> dict | None:
             "rsi":       round(vrsi, 1),
         }
 
-    if se >= THRESHOLD and se > sb:
+    if se >= THRESHOLD and se > sb and bear_ema_aligned:
         entry = price
         return {
             "direction": "SELL",
