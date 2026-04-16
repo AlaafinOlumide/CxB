@@ -261,6 +261,11 @@ def analyse(candles):
     bull_ema_aligned = v21 > v50 > v200
     bear_ema_aligned = v21 < v50 < v200
 
+    # Always log detailed score for diagnostics
+    ema_status = "BULL" if bull_ema_aligned else ("BEAR" if bear_ema_aligned else "MIXED/RANGING")
+    log.info("Score -> Bull:%d/8  Bear:%d/8  | EMA:%s | RSI:%.1f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
+             sb, se, ema_status, vrsi, v21, v50, v200)
+
     if sb >= THRESHOLD and sb > se and bull_ema_aligned:
         entry = price
         return {
@@ -406,7 +411,7 @@ def bot_loop():
                 else:
                     log.info("Duplicate signal skipped.")
             else:
-                log.info("No setup — score below %d/8 or EMA not aligned.", THRESHOLD)
+                log.info("No signal fired. Check Score log above for details.")
 
         except Exception as e:
             log.error("Loop error: %s", e)
