@@ -6,7 +6,7 @@ Signals   : Telegram
 Hosting   : Render (free web service + keep-alive)
 Strategy  : Multi-confluence scoring
             EMA trend stack + RSI + MACD + StochRSI + ATR
-            Signal fires at ≥ 6/8 — targets 80%+ win rate
+            Signal fires at >= 4/8 with mandatory EMA gate
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -15,6 +15,7 @@ import time
 import logging
 import threading
 import requests
+from datetime import datetime, timezone
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -26,14 +27,14 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOL      = "XAU/USD"
-INTERVAL    = "15min"       # 15-minute candles
-SCAN_EVERY  = 60 * 15       # scan every 15 minutes
-CANDLES     = 100           # 1 API call per scan — well within free limits
+INTERVAL    = "15min"
+SCAN_EVERY  = 60 * 15        # every 15 minutes
+CANDLES     = 100
 
-TP1_RATIO   = 1.5           # TP1 = 1.5× ATR from entry
-TP2_RATIO   = 3.0           # TP2 = 3.0× ATR from entry
-ATR_MULT    = 1.2           # SL = 1.2× ATR from entry
-THRESHOLD   = 5             # minimum score out of 8 to fire a signal
+TP1_RATIO   = 1.5
+TP2_RATIO   = 3.0
+ATR_MULT    = 1.2
+THRESHOLD   = 4              # lowered to 4/8 — EMA gate still mandatory
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +43,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── FLASK KEEP-ALIVE (Render free tier) ──────────────────────────────────────
+# ─── FLASK KEEP-ALIVE ──────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
@@ -59,8 +60,7 @@ def run_flask():
 
 # ─── TWELVEDATA ────────────────────────────────────────────────────────────────
 
-def fetch_candles() -> list[dict] | None:
-    """Fetch OHLCV from TwelveData. Returns list newest→oldest."""
+def fetch_candles():
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol":     SYMBOL,
@@ -92,7 +92,7 @@ def fetch_candles() -> list[dict] | None:
 
 # ─── INDICATORS ────────────────────────────────────────────────────────────────
 
-def ema(values: list[float], period: int) -> list[float | None]:
+def ema(values, period):
     k      = 2 / (period + 1)
     result = [None] * len(values)
     if len(values) < period:
@@ -103,7 +103,7 @@ def ema(values: list[float], period: int) -> list[float | None]:
     return result
 
 
-def rsi(closes: list[float], period: int = 14) -> list[float | None]:
+def rsi(closes, period=14):
     out = [None] * len(closes)
     if len(closes) < period + 1:
         return out
@@ -119,12 +119,12 @@ def rsi(closes: list[float], period: int = 14) -> list[float | None]:
             d  = closes[i] - closes[i - 1]
             ag = (ag * (period - 1) + max(d, 0)) / period
             al = (al * (period - 1) + max(-d, 0)) / period
-        rs       = ag / al if al != 0 else 100
-        out[i]   = 100 - (100 / (1 + rs))
+        rs     = ag / al if al != 0 else 100
+        out[i] = 100 - (100 / (1 + rs))
     return out
 
 
-def macd(closes: list[float], fast=12, slow=26, sig=9):
+def macd(closes, fast=12, slow=26, sig=9):
     ef   = ema(closes, fast)
     es   = ema(closes, slow)
     line = [
@@ -136,7 +136,8 @@ def macd(closes: list[float], fast=12, slow=26, sig=9):
     offset = next(i for i, v in enumerate(line) if v is not None)
     sig_f  = [None] * len(line)
     for i, v in enumerate(sig_r):
-        sig_f[offset + i] = v
+        if offset + i < len(sig_f):
+            sig_f[offset + i] = v
     hist = [
         (m - s) if m is not None and s is not None else None
         for m, s in zip(line, sig_f)
@@ -144,7 +145,7 @@ def macd(closes: list[float], fast=12, slow=26, sig=9):
     return line, sig_f, hist
 
 
-def atr(candles: list[dict], period: int = 14) -> list[float | None]:
+def atr(candles, period=14):
     trs = [None]
     for i in range(1, len(candles)):
         h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
@@ -158,7 +159,7 @@ def atr(candles: list[dict], period: int = 14) -> list[float | None]:
     return out
 
 
-def stoch_rsi(rsi_vals: list, period=14, smooth_k=3, smooth_d=3):
+def stoch_rsi(rsi_vals, period=14, smooth_k=3, smooth_d=3):
     stoch = [None] * len(rsi_vals)
     valid = [(i, v) for i, v in enumerate(rsi_vals) if v is not None]
     if len(valid) < period:
@@ -181,28 +182,16 @@ def stoch_rsi(rsi_vals: list, period=14, smooth_k=3, smooth_d=3):
     d_line = smooth(k_line, smooth_d)
     return k_line, d_line
 
-# ─── SIGNAL ENGINE ──────────────────────────────────────────────────────────────
-#
-#  8-point confluence scoring:
-#
-#  1. EMA trend stack    (2pts)  21>50>200 = bull | 21<50<200 = bear
-#  2. Price vs 50 EMA   (1pt)   price > e50 = bull
-#  3. RSI direction     (1pt)   RSI >55 bull | <45 bear
-#  4. RSI room to run   (1pt)   55<RSI<70 bull | 30<RSI<45 bear
-#  5. MACD histogram    (1pt)   >0 bull | <0 bear
-#  6. MACD line vs sig  (1pt)   line > sig = bull
-#  7. Stoch RSI         (1pt)   K >55 bull | K <45 bear
-#
-#  Signal fires when score ≥ 6  →  ~75-80%+ historical confluence rate
+# ─── SIGNAL ENGINE ─────────────────────────────────────────────────────────────
 
-def analyse(candles: list[dict]) -> dict | None:
+def analyse(candles):
     if len(candles) < 60:
         return None
 
-    c      = list(reversed(candles))       # oldest → newest for math
+    c      = list(reversed(candles))
     closes = [x["close"] for x in c]
     n      = len(closes)
-    i      = n - 1                         # index of most recent candle
+    i      = n - 1
 
     e21  = ema(closes, 21)
     e50  = ema(closes, 50)
@@ -220,10 +209,10 @@ def analyse(candles: list[dict]) -> dict | None:
     v21, v50, v200, vrsi, vml, vms, vmh, vatr = vals
     kval = sk[i]
 
-    sb, se = 0, 0          # bull score, bear score
-    rb, re = [], []        # bull reasons, bear reasons
+    sb, se = 0, 0
+    rb, re = [], []
 
-    # 1. EMA stack (2pts)
+    # 1. EMA stack (2pts) — also used as mandatory gate
     if v21 > v50 > v200:
         sb += 2; rb.append("EMA stack bullish (21 > 50 > 200)")
     elif v21 < v50 < v200:
@@ -249,9 +238,9 @@ def analyse(candles: list[dict]) -> dict | None:
 
     # 5. MACD histogram (1pt)
     if vmh > 0:
-        sb += 1; rb.append("MACD histogram positive (momentum rising)")
+        sb += 1; rb.append("MACD histogram positive")
     elif vmh < 0:
-        se += 1; re.append("MACD histogram negative (momentum falling)")
+        se += 1; re.append("MACD histogram negative")
 
     # 6. MACD line vs signal (1pt)
     if vml > vms:
@@ -268,6 +257,7 @@ def analyse(candles: list[dict]) -> dict | None:
 
     sl_dist = vatr * ATR_MULT
 
+    # Mandatory gate: EMA stack must be aligned regardless of score
     bull_ema_aligned = v21 > v50 > v200
     bear_ema_aligned = v21 < v50 < v200
 
@@ -305,7 +295,7 @@ def analyse(candles: list[dict]) -> dict | None:
 
 # ─── TELEGRAM ──────────────────────────────────────────────────────────────────
 
-def send_telegram(text: str) -> bool:
+def send_telegram(text):
     url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
@@ -317,7 +307,7 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def format_signal(sig: dict, ts: str) -> str:
+def format_signal(sig, ts):
     reasons   = "\n".join(f"  • {r}" for r in sig["reasons"])
     filled    = "█" * sig["score"]
     empty     = "░" * (8 - sig["score"])
@@ -343,33 +333,63 @@ def format_signal(sig: dict, ts: str) -> str:
 # ─── DUPLICATE GUARD ───────────────────────────────────────────────────────────
 _last = {"direction": None, "time": None}
 
-def is_dup(sig: dict, ts: str) -> bool:
+def is_dup(sig, ts):
     return _last["direction"] == sig["direction"] and _last["time"] == ts
+
+# ─── SCAN COUNTER (for daily heartbeat) ───────────────────────────────────────
+_scan_count   = 0
+_last_hb_date = None
 
 # ─── BOT LOOP ──────────────────────────────────────────────────────────────────
 
 def bot_loop():
-    log.info("🚀 XAUUSD Signal Bot started")
+    global _scan_count, _last_hb_date
+
+    log.info("XAUUSD Signal Bot started")
     send_telegram(
         "🤖 <b>XAUUSD Signal Bot Online</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📈 Pair: XAU/USD  |  Timeframe: 15m\n"
         "🔍 Scanning every 15 minutes\n"
-        "⚙️ Signals require 5/8 confluence factors\n"
+        "⚙️ Signals require 4/8 confluence (EMA gate mandatory)\n"
+        "💬 Daily status update sent every morning at 08:00 UTC\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "<i>Indicators: EMA21/50/200 · RSI · MACD · StochRSI · ATR</i>"
     )
 
     while True:
         try:
-            log.info("Fetching XAUUSD candles…")
+            now       = datetime.now(timezone.utc)
+            today_str = now.strftime("%Y-%m-%d")
+
+            # ── Daily heartbeat at 08:00 UTC ──────────────────────────────────
+            if now.hour == 8 and now.minute < 15 and _last_hb_date != today_str:
+                candles_hb = fetch_candles()
+                price_hb   = candles_hb[0]["close"] if candles_hb else 0.0
+                send_telegram(
+                    f"🟡 <b>Daily Status — {today_str}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✅ Bot is alive and scanning\n"
+                    f"💰 XAU/USD current price: <code>{price_hb:.2f}</code>\n"
+                    f"🔍 Scans completed today: {_scan_count}\n"
+                    f"⚙️ Threshold: {THRESHOLD}/8  |  TF: 15m\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<i>Next signal fires when 4+ confluence factors align with EMA trend</i>"
+                )
+                _last_hb_date = today_str
+                _scan_count   = 0   # reset daily counter
+
+            # ── Main scan ─────────────────────────────────────────────────────
+            log.info("Scanning… (scan #%d today)", _scan_count + 1)
             candles = fetch_candles()
 
             if candles is None:
                 log.warning("No data — retry in 60s")
+                send_telegram("⚠️ <b>Warning:</b> Failed to fetch XAU/USD data. Retrying in 60s.")
                 time.sleep(60)
                 continue
 
+            _scan_count += 1
             ts    = candles[0]["time"]
             price = candles[0]["close"]
             log.info("Candle [%s]  close=%.2f", ts, price)
@@ -380,16 +400,17 @@ def bot_loop():
                     msg  = format_signal(sig, ts)
                     sent = send_telegram(msg)
                     if sent:
-                        log.info("✅ Signal sent: %s @ %.2f  score=%d/8",
+                        log.info("Signal sent: %s @ %.2f  score=%d/8",
                                  sig["direction"], sig["entry"], sig["score"])
                         _last.update({"direction": sig["direction"], "time": ts})
                 else:
                     log.info("Duplicate signal skipped.")
             else:
-                log.info("No setup (confluence < %d/8)", THRESHOLD)
+                log.info("No setup — score below %d/8 or EMA not aligned.", THRESHOLD)
 
         except Exception as e:
             log.error("Loop error: %s", e)
+            send_telegram(f"🔴 <b>Bot error:</b> <code>{str(e)[:200]}</code>")
 
         time.sleep(SCAN_EVERY)
 
@@ -397,8 +418,6 @@ def bot_loop():
 # ─── ENTRY ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Run Flask in a background thread (Render needs a web server to stay alive)
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
-    # Run bot in main thread
     bot_loop()
