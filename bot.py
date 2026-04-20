@@ -3,7 +3,7 @@ XAUUSD Signal Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Data      : TwelveData  (free: 8 req/min, 800/day)
 Signals   : Telegram
-Hosting   : Render (free web service + keep-alive)
+Hosting   : Render (paid web service + keep-alive)
 Strategy  : Multi-confluence scoring
             EMA trend stack + RSI + MACD + StochRSI + ATR
             Signal fires at >= 4/8 with mandatory EMA gate
