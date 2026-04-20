@@ -3,10 +3,10 @@ XAUUSD Signal Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Data      : TwelveData  (free: 8 req/min, 800/day)
 Signals   : Telegram
-Hosting   : Render (paid web service + keep-alive)
+Hosting   : Render (free web service + keep-alive)
 Strategy  : Multi-confluence scoring
-            EMA trend stack + RSI + MACD + StochRSI + ATR
-            Signal fires at >= 4/8 with mandatory EMA gate
+            Trend gate + RSI + MACD + StochRSI + ATR
+            Signal fires at >= 4/8 with relaxed trend gate
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -28,8 +28,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOL      = "XAU/USD"
 INTERVAL    = "15min"
-SCAN_EVERY  = 60 * 15
-CANDLES     = 250          # FIXED: must be > 200 for EMA200
+CANDLES     = 250
 MIN_BARS    = 250
 
 TP1_RATIO   = 1.5
@@ -106,6 +105,7 @@ def ema(values, period):
     result = [None] * len(values)
     if len(values) < period:
         return result
+
     result[period - 1] = sum(values[:period]) / period
     for i in range(period, len(values)):
         result[i] = values[i] * k + result[i - 1] * (1 - k)
@@ -131,8 +131,10 @@ def rsi(closes, period=14):
             d = closes[i] - closes[i - 1]
             ag = (ag * (period - 1) + max(d, 0)) / period
             al = (al * (period - 1) + max(-d, 0)) / period
+
         rs = ag / al if al != 0 else 100
         out[i] = 100 - (100 / (1 + rs))
+
     return out
 
 
@@ -151,8 +153,8 @@ def macd(closes, fast=12, slow=26, sig=9):
 
     sig_r = ema(valid, sig)
     offset = next(i for i, v in enumerate(line) if v is not None)
-    sig_f = [None] * len(line)
 
+    sig_f = [None] * len(line)
     for i, v in enumerate(sig_r):
         if offset + i < len(sig_f):
             sig_f[offset + i] = v
@@ -161,6 +163,7 @@ def macd(closes, fast=12, slow=26, sig=9):
         (m - s) if m is not None and s is not None else None
         for m, s in zip(line, sig_f)
     ]
+
     return line, sig_f, hist
 
 
@@ -177,6 +180,7 @@ def atr(candles, period=14):
     out[period] = sum(trs[1:period + 1]) / period
     for i in range(period + 1, len(trs)):
         out[i] = (out[i - 1] * (period - 1) + trs[i]) / period
+
     return out
 
 
@@ -241,13 +245,13 @@ def analyse(candles):
     sb, se = 0, 0
     rb, re = [], []
 
-    # 1. EMA stack (2pts) — mandatory gate
-    if v21 > v50 > v200:
+    # 1. Trend gate scoring (2pts)
+    if price > v200 and v21 > v50:
         sb += 2
-        rb.append("EMA stack bullish (21 > 50 > 200)")
-    elif v21 < v50 < v200:
+        rb.append("Trend bullish: price above 200 EMA and EMA21 > EMA50")
+    elif price < v200 and v21 < v50:
         se += 2
-        re.append("EMA stack bearish (21 < 50 < 200)")
+        re.append("Trend bearish: price below 200 EMA and EMA21 < EMA50")
 
     # 2. Price vs 50 EMA (1pt)
     if price > v50:
@@ -266,10 +270,10 @@ def analyse(candles):
         re.append(f"RSI bearish zone ({vrsi:.1f})")
 
     # 4. RSI room to run (1pt)
-    if 55 < vrsi < 70:
+    if 55 < vrsi < 72:
         sb += 1
         rb.append("RSI has room — not yet overbought")
-    elif 30 < vrsi < 45:
+    elif 28 < vrsi < 45:
         se += 1
         re.append("RSI has room — not yet oversold")
 
@@ -300,16 +304,22 @@ def analyse(candles):
 
     sl_dist = vatr * ATR_MULT
 
-    bull_ema_aligned = v21 > v50 > v200
-    bear_ema_aligned = v21 < v50 < v200
+    # Relaxed mandatory gate
+    bull_trend_ok = price > v200 and v21 > v50
+    bear_trend_ok = price < v200 and v21 < v50
 
-    ema_status = "BULL" if bull_ema_aligned else ("BEAR" if bear_ema_aligned else "MIXED/RANGING")
-    log.info(
-        "Score -> Bull:%d/8  Bear:%d/8  | EMA:%s | RSI:%.1f | EMA21:%.2f EMA50:%.2f EMA200:%.2f | Price:%.2f",
-        sb, se, ema_status, vrsi, v21, v50, v200, price
+    trend_status = (
+        "BULL" if bull_trend_ok else
+        "BEAR" if bear_trend_ok else
+        "MIXED/RANGING"
     )
 
-    if sb >= THRESHOLD and sb > se and bull_ema_aligned:
+    log.info(
+        "Score -> Bull:%d/8  Bear:%d/8  | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
+        sb, se, trend_status, vrsi, price, v21, v50, v200
+    )
+
+    if sb >= THRESHOLD and sb > se and bull_trend_ok:
         entry = price
         return {
             "direction": "BUY",
@@ -324,7 +334,7 @@ def analyse(candles):
             "rsi": round(vrsi, 1),
         }
 
-    if se >= THRESHOLD and se > sb and bear_ema_aligned:
+    if se >= THRESHOLD and se > sb and bear_trend_ok:
         entry = price
         return {
             "direction": "SELL",
@@ -417,7 +427,7 @@ def bot_loop():
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📈 Pair: XAU/USD  |  Timeframe: 15m\n"
         "🔍 Scanning on each 15-minute candle close\n"
-        "⚙️ Signals require 4/8 confluence (EMA gate mandatory)\n"
+        "⚙️ Signals require 4/8 confluence with relaxed trend gate\n"
         "📦 Data bars loaded: 250 (EMA200-ready)\n"
         "💬 Daily status update sent every morning at 08:00 UTC\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -432,9 +442,7 @@ def bot_loop():
             # Daily heartbeat at 08:00 UTC
             if now.hour == 8 and now.minute < 15 and _last_hb_date != today_str:
                 candles_hb = fetch_candles()
-                latest_price = 0.0
-                if candles_hb:
-                    latest_price = candles_hb[0]["close"]
+                latest_price = candles_hb[0]["close"] if candles_hb else 0.0
 
                 send_telegram(
                     f"🟡 <b>Daily Status — {today_str}</b>\n"
@@ -444,7 +452,7 @@ def bot_loop():
                     f"🔍 Scans completed today: {_scan_count}\n"
                     f"⚙️ Threshold: {THRESHOLD}/8  |  TF: 15m\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<i>Next signal fires when 4+ confluence factors align with EMA trend</i>"
+                    f"<i>Next signal fires when 4+ confluence factors align with trend gate</i>"
                 )
                 _last_hb_date = today_str
                 _scan_count = 0
