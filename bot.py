@@ -3,10 +3,10 @@ XAUUSD Signal Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Data      : TwelveData  (free: 8 req/min, 800/day)
 Signals   : Telegram
-Hosting   : Render (free web service + keep-alive)
-Strategy  : Multi-confluence scoring
-            Trend gate + RSI + MACD + StochRSI + ATR
-            Signal fires at >= 4/8 with relaxed trend gate
+Hosting   : Render (paid web service + keep-alive)
+Strategy  : Trend-following confluence bot
+            Bias from EMA21/50/200
+            Entry confirmation from RSI + MACD + StochRSI + ATR
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -34,7 +34,7 @@ MIN_BARS    = 250
 TP1_RATIO   = 1.5
 TP2_RATIO   = 3.0
 ATR_MULT    = 1.2
-THRESHOLD   = 4
+THRESHOLD   = 4   # out of 6
 
 logging.basicConfig(
     level=logging.INFO,
@@ -227,7 +227,7 @@ def analyse(candles):
     rsi_ = rsi(closes, 14)
     ml, ms, mh = macd(closes)
     atr_ = atr(c, 14)
-    sk, _ = stoch_rsi(rsi_)
+    sk, sd = stoch_rsi(rsi_)
 
     price = closes[i]
 
@@ -241,113 +241,137 @@ def analyse(candles):
 
     v21, v50, v200, vrsi, vml, vms, vmh, vatr = vals
     kval = sk[i]
+    dval = sd[i] if i < len(sd) else None
 
-    sb, se = 0, 0
-    rb, re = [], []
-
-    # 1. Trend gate scoring (2pts)
-    if price > v200 and v21 > v50:
-        sb += 2
-        rb.append("Trend bullish: price above 200 EMA and EMA21 > EMA50")
-    elif price < v200 and v21 < v50:
-        se += 2
-        re.append("Trend bearish: price below 200 EMA and EMA21 < EMA50")
-
-    # 2. Price vs 50 EMA (1pt)
-    if price > v50:
-        sb += 1
-        rb.append(f"Price above 50 EMA ({v50:.2f})")
-    else:
-        se += 1
-        re.append(f"Price below 50 EMA ({v50:.2f})")
-
-    # 3. RSI direction (1pt)
-    if vrsi > 55:
-        sb += 1
-        rb.append(f"RSI bullish zone ({vrsi:.1f})")
-    elif vrsi < 45:
-        se += 1
-        re.append(f"RSI bearish zone ({vrsi:.1f})")
-
-    # 4. RSI room to run (1pt)
-    if 55 < vrsi < 72:
-        sb += 1
-        rb.append("RSI has room — not yet overbought")
-    elif 28 < vrsi < 45:
-        se += 1
-        re.append("RSI has room — not yet oversold")
-
-    # 5. MACD histogram (1pt)
-    if vmh > 0:
-        sb += 1
-        rb.append("MACD histogram positive")
-    elif vmh < 0:
-        se += 1
-        re.append("MACD histogram negative")
-
-    # 6. MACD line vs signal (1pt)
-    if vml > vms:
-        sb += 1
-        rb.append("MACD line above signal line")
-    elif vml < vms:
-        se += 1
-        re.append("MACD line below signal line")
-
-    # 7. Stoch RSI (1pt)
-    if kval is not None:
-        if kval > 55:
-            sb += 1
-            rb.append(f"Stoch RSI bullish ({kval:.1f})")
-        elif kval < 45:
-            se += 1
-            re.append(f"Stoch RSI bearish ({kval:.1f})")
-
-    sl_dist = vatr * ATR_MULT
-
-    # Relaxed mandatory gate
+    # ── TREND / BIAS ──────────────────────────────────────────────────────────
     bull_trend_ok = price > v200 and v21 > v50
     bear_trend_ok = price < v200 and v21 < v50
 
-    trend_status = (
-        "BULL" if bull_trend_ok else
-        "BEAR" if bear_trend_ok else
-        "MIXED/RANGING"
-    )
+    if bull_trend_ok:
+        trend_status = "BULL"
+    elif bear_trend_ok:
+        trend_status = "BEAR"
+    else:
+        trend_status = "MIXED/RANGING"
 
-    log.info(
-        "Score -> Bull:%d/8  Bear:%d/8  | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
-        sb, se, trend_status, vrsi, price, v21, v50, v200
-    )
+    # Skip mixed conditions completely
+    if trend_status == "MIXED/RANGING":
+        log.info(
+            "Score -> NONE | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
+            trend_status, vrsi, price, v21, v50, v200
+        )
+        return None
 
-    if sb >= THRESHOLD and sb > se and bull_trend_ok:
-        entry = price
-        return {
-            "direction": "BUY",
-            "emoji": "🟢",
-            "entry": entry,
-            "sl": round(entry - sl_dist, 2),
-            "tp1": round(entry + sl_dist * TP1_RATIO, 2),
-            "tp2": round(entry + sl_dist * TP2_RATIO, 2),
-            "score": sb,
-            "reasons": rb,
-            "atr": round(vatr, 2),
-            "rsi": round(vrsi, 1),
-        }
+    score = 0
+    reasons = []
 
-    if se >= THRESHOLD and se > sb and bear_trend_ok:
-        entry = price
-        return {
-            "direction": "SELL",
-            "emoji": "🔴",
-            "entry": entry,
-            "sl": round(entry + sl_dist, 2),
-            "tp1": round(entry - sl_dist * TP1_RATIO, 2),
-            "tp2": round(entry - sl_dist * TP2_RATIO, 2),
-            "score": se,
-            "reasons": re,
-            "atr": round(vatr, 2),
-            "rsi": round(vrsi, 1),
-        }
+    # ── BULLISH ENTRY SCORING ────────────────────────────────────────────────
+    if bull_trend_ok:
+        # 1. Trend alignment (1)
+        score += 1
+        reasons.append("Trend bullish: price above 200 EMA and EMA21 > EMA50")
+
+        # 2. Price above 50 EMA (1)
+        if price > v50:
+            score += 1
+            reasons.append(f"Price above 50 EMA ({v50:.2f})")
+
+        # 3. RSI bullish zone (1)
+        if vrsi > 55:
+            score += 1
+            reasons.append(f"RSI bullish zone ({vrsi:.1f})")
+
+        # 4. RSI not stretched (1)
+        if 55 < vrsi < 72:
+            score += 1
+            reasons.append("RSI has room — not yet overbought")
+
+        # 5. MACD confirmation (1)
+        if vmh > 0 and vml > vms:
+            score += 1
+            reasons.append("MACD bullish confirmation")
+
+        # 6. Stoch RSI confirmation (1)
+        if kval is not None and dval is not None and kval > dval and kval > 50:
+            score += 1
+            reasons.append(f"Stoch RSI bullish crossover/strength ({kval:.1f})")
+
+        sl_dist = vatr * ATR_MULT
+
+        log.info(
+            "Score -> BUY:%d/6 | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
+            score, trend_status, vrsi, price, v21, v50, v200
+        )
+
+        if score >= THRESHOLD:
+            entry = price
+            return {
+                "direction": "BUY",
+                "emoji": "🟢",
+                "entry": entry,
+                "sl": round(entry - sl_dist, 2),
+                "tp1": round(entry + sl_dist * TP1_RATIO, 2),
+                "tp2": round(entry + sl_dist * TP2_RATIO, 2),
+                "score": score,
+                "max_score": 6,
+                "reasons": reasons,
+                "atr": round(vatr, 2),
+                "rsi": round(vrsi, 1),
+            }
+
+    # ── BEARISH ENTRY SCORING ────────────────────────────────────────────────
+    if bear_trend_ok:
+        # 1. Trend alignment (1)
+        score += 1
+        reasons.append("Trend bearish: price below 200 EMA and EMA21 < EMA50")
+
+        # 2. Price below 50 EMA (1)
+        if price < v50:
+            score += 1
+            reasons.append(f"Price below 50 EMA ({v50:.2f})")
+
+        # 3. RSI bearish zone (1)
+        if vrsi < 45:
+            score += 1
+            reasons.append(f"RSI bearish zone ({vrsi:.1f})")
+
+        # 4. RSI not stretched (1)
+        if 28 < vrsi < 45:
+            score += 1
+            reasons.append("RSI has room — not yet oversold")
+
+        # 5. MACD confirmation (1)
+        if vmh < 0 and vml < vms:
+            score += 1
+            reasons.append("MACD bearish confirmation")
+
+        # 6. Stoch RSI confirmation (1)
+        if kval is not None and dval is not None and kval < dval and kval < 50:
+            score += 1
+            reasons.append(f"Stoch RSI bearish crossover/strength ({kval:.1f})")
+
+        sl_dist = vatr * ATR_MULT
+
+        log.info(
+            "Score -> SELL:%d/6 | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
+            score, trend_status, vrsi, price, v21, v50, v200
+        )
+
+        if score >= THRESHOLD:
+            entry = price
+            return {
+                "direction": "SELL",
+                "emoji": "🔴",
+                "entry": entry,
+                "sl": round(entry + sl_dist, 2),
+                "tp1": round(entry - sl_dist * TP1_RATIO, 2),
+                "tp2": round(entry - sl_dist * TP2_RATIO, 2),
+                "score": score,
+                "max_score": 6,
+                "reasons": reasons,
+                "atr": round(vatr, 2),
+                "rsi": round(vrsi, 1),
+            }
 
     return None
 
@@ -368,7 +392,7 @@ def send_telegram(text):
 def format_signal(sig, ts):
     reasons = "\n".join(f"  • {r}" for r in sig["reasons"])
     filled = "█" * sig["score"]
-    empty = "░" * (8 - sig["score"])
+    empty = "░" * (sig["max_score"] - sig["score"])
     direction = f"{sig['emoji']} <b>{sig['direction']}</b>"
 
     return (
@@ -381,7 +405,7 @@ def format_signal(sig, ts):
         f"<b>TP 2 :</b>     <code>{sig['tp2']:.2f}</code>\n"
         f"<b>Stop Loss :</b> <code>{sig['sl']:.2f}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Confluence :</b> {filled}{empty}  {sig['score']}/8\n"
+        f"<b>Confluence :</b> {filled}{empty}  {sig['score']}/{sig['max_score']}\n"
         f"<b>RSI :</b> {sig['rsi']}    <b>ATR :</b> {sig['atr']}\n"
         f"\n<b>📊 Analysis:</b>\n{reasons}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -427,7 +451,7 @@ def bot_loop():
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📈 Pair: XAU/USD  |  Timeframe: 15m\n"
         "🔍 Scanning on each 15-minute candle close\n"
-        "⚙️ Signals require 4/8 confluence with relaxed trend gate\n"
+        "⚙️ Trend-following mode enabled\n"
         "📦 Data bars loaded: 250 (EMA200-ready)\n"
         "💬 Daily status update sent every morning at 08:00 UTC\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -439,7 +463,6 @@ def bot_loop():
             now = datetime.now(timezone.utc)
             today_str = now.strftime("%Y-%m-%d")
 
-            # Daily heartbeat at 08:00 UTC
             if now.hour == 8 and now.minute < 15 and _last_hb_date != today_str:
                 candles_hb = fetch_candles()
                 latest_price = candles_hb[0]["close"] if candles_hb else 0.0
@@ -450,9 +473,9 @@ def bot_loop():
                     f"✅ Bot is alive and scanning\n"
                     f"💰 XAU/USD current price: <code>{latest_price:.2f}</code>\n"
                     f"🔍 Scans completed today: {_scan_count}\n"
-                    f"⚙️ Threshold: {THRESHOLD}/8  |  TF: 15m\n"
+                    f"⚙️ Threshold: {THRESHOLD}/6  |  TF: 15m\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<i>Next signal fires when 4+ confluence factors align with trend gate</i>"
+                    f"<i>Next signal fires when trend and confluence align</i>"
                 )
                 _last_hb_date = today_str
                 _scan_count = 0
@@ -478,8 +501,8 @@ def bot_loop():
                     sent = send_telegram(msg)
                     if sent:
                         log.info(
-                            "Signal sent: %s @ %.2f  score=%d/8",
-                            sig["direction"], sig["entry"], sig["score"]
+                            "Signal sent: %s @ %.2f  score=%d/%d",
+                            sig["direction"], sig["entry"], sig["score"], sig["max_score"]
                         )
                         _last.update({"direction": sig["direction"], "time": ts})
                 else:
