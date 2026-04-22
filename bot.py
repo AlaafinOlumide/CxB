@@ -3,15 +3,16 @@ XAUUSD Signal Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Data      : TwelveData  (free: 8 req/min, 800/day)
 Signals   : Telegram
-Hosting   : Render (paid web service + keep-alive)
+Hosting   : Render (free web service + keep-alive)
 Strategy  : Trend-following confluence bot
             Bias from EMA21/50/200
-            Entry confirmation from RSI + MACD + StochRSI + ATR
+            Entry confirmation from RSI + MACD + StochRSI + Bollinger Bands + ATR
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os
 import time
+import math
 import logging
 import threading
 import requests
@@ -34,7 +35,7 @@ MIN_BARS    = 250
 TP1_RATIO   = 1.5
 TP2_RATIO   = 3.0
 ATR_MULT    = 1.2
-THRESHOLD   = 4   # out of 6
+THRESHOLD   = 5   # out of 7
 
 logging.basicConfig(
     level=logging.INFO,
@@ -209,6 +210,27 @@ def stoch_rsi(rsi_vals, period=14, smooth_k=3, smooth_d=3):
     d_line = smooth(k_line, smooth_d)
     return k_line, d_line
 
+
+def bollinger_bands(closes, period=20, std_mult=2.0):
+    mid = [None] * len(closes)
+    upper = [None] * len(closes)
+    lower = [None] * len(closes)
+
+    if len(closes) < period:
+        return mid, upper, lower
+
+    for i in range(period - 1, len(closes)):
+        window = closes[i - period + 1:i + 1]
+        mean = sum(window) / period
+        variance = sum((x - mean) ** 2 for x in window) / period
+        std = math.sqrt(variance)
+
+        mid[i] = mean
+        upper[i] = mean + std_mult * std
+        lower[i] = mean - std_mult * std
+
+    return mid, upper, lower
+
 # ─── SIGNAL ENGINE ─────────────────────────────────────────────────────────────
 
 def analyse(candles):
@@ -228,22 +250,23 @@ def analyse(candles):
     ml, ms, mh = macd(closes)
     atr_ = atr(c, 14)
     sk, sd = stoch_rsi(rsi_)
+    bb_mid, bb_upper, bb_lower = bollinger_bands(closes, 20, 2.0)
 
     price = closes[i]
 
-    vals = [e21[i], e50[i], e200[i], rsi_[i], ml[i], ms[i], mh[i], atr_[i]]
+    vals = [
+        e21[i], e50[i], e200[i], rsi_[i], ml[i], ms[i], mh[i], atr_[i],
+        bb_mid[i], bb_upper[i], bb_lower[i]
+    ]
     if any(v is None for v in vals):
-        log.warning(
-            "Indicators not ready | e21=%s e50=%s e200=%s rsi=%s macd=%s signal=%s hist=%s atr=%s",
-            e21[i], e50[i], e200[i], rsi_[i], ml[i], ms[i], mh[i], atr_[i]
-        )
+        log.warning("Indicators not ready on latest bar.")
         return None
 
-    v21, v50, v200, vrsi, vml, vms, vmh, vatr = vals
+    v21, v50, v200, vrsi, vml, vms, vmh, vatr, vbb_mid, vbb_upper, vbb_lower = vals
     kval = sk[i]
     dval = sd[i] if i < len(sd) else None
 
-    # ── TREND / BIAS ──────────────────────────────────────────────────────────
+    # Trend / bias
     bull_trend_ok = price > v200 and v21 > v50
     bear_trend_ok = price < v200 and v21 < v50
 
@@ -254,53 +277,61 @@ def analyse(candles):
     else:
         trend_status = "MIXED/RANGING"
 
-    # Skip mixed conditions completely
     if trend_status == "MIXED/RANGING":
         log.info(
-            "Score -> NONE | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
-            trend_status, vrsi, price, v21, v50, v200
+            "Score -> NONE | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f | BBmid:%.2f",
+            trend_status, vrsi, price, v21, v50, v200, vbb_mid
         )
         return None
 
     score = 0
     reasons = []
+    sl_dist = vatr * ATR_MULT
 
-    # ── BULLISH ENTRY SCORING ────────────────────────────────────────────────
+    # ── BULLISH SCORING ───────────────────────────────────────────────────────
     if bull_trend_ok:
-        # 1. Trend alignment (1)
+        # 1. Trend
         score += 1
         reasons.append("Trend bullish: price above 200 EMA and EMA21 > EMA50")
 
-        # 2. Price above 50 EMA (1)
+        # 2. Price above 50 EMA
         if price > v50:
             score += 1
             reasons.append(f"Price above 50 EMA ({v50:.2f})")
 
-        # 3. RSI bullish zone (1)
+        # 3. RSI bullish
         if vrsi > 55:
             score += 1
             reasons.append(f"RSI bullish zone ({vrsi:.1f})")
 
-        # 4. RSI not stretched (1)
+        # 4. RSI not stretched
         if 55 < vrsi < 72:
             score += 1
             reasons.append("RSI has room — not yet overbought")
 
-        # 5. MACD confirmation (1)
+        # 5. MACD bullish
         if vmh > 0 and vml > vms:
             score += 1
             reasons.append("MACD bullish confirmation")
 
-        # 6. Stoch RSI confirmation (1)
+        # 6. Stoch RSI bullish
         if kval is not None and dval is not None and kval > dval and kval > 50:
             score += 1
             reasons.append(f"Stoch RSI bullish crossover/strength ({kval:.1f})")
 
-        sl_dist = vatr * ATR_MULT
+        # 7. Bollinger Bands location
+        # Prefer price not chasing above upper band.
+        # Bonus if price is between middle band and upper band, or slightly above middle band.
+        if price <= vbb_upper:
+            score += 1
+            if price >= vbb_mid:
+                reasons.append("Bollinger location supportive: price above mid-band but not overextended")
+            else:
+                reasons.append("Bollinger location acceptable: price not overextended above upper band")
 
         log.info(
-            "Score -> BUY:%d/6 | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
-            score, trend_status, vrsi, price, v21, v50, v200
+            "Score -> BUY:%d/7 | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f | BBmid:%.2f BBup:%.2f BBlow:%.2f",
+            score, trend_status, vrsi, price, v21, v50, v200, vbb_mid, vbb_upper, vbb_lower
         )
 
         if score >= THRESHOLD:
@@ -313,48 +344,59 @@ def analyse(candles):
                 "tp1": round(entry + sl_dist * TP1_RATIO, 2),
                 "tp2": round(entry + sl_dist * TP2_RATIO, 2),
                 "score": score,
-                "max_score": 6,
+                "max_score": 7,
                 "reasons": reasons,
                 "atr": round(vatr, 2),
                 "rsi": round(vrsi, 1),
+                "bb_mid": round(vbb_mid, 2),
+                "bb_upper": round(vbb_upper, 2),
+                "bb_lower": round(vbb_lower, 2),
             }
 
-    # ── BEARISH ENTRY SCORING ────────────────────────────────────────────────
+    # ── BEARISH SCORING ───────────────────────────────────────────────────────
     if bear_trend_ok:
-        # 1. Trend alignment (1)
+        # 1. Trend
         score += 1
         reasons.append("Trend bearish: price below 200 EMA and EMA21 < EMA50")
 
-        # 2. Price below 50 EMA (1)
+        # 2. Price below 50 EMA
         if price < v50:
             score += 1
             reasons.append(f"Price below 50 EMA ({v50:.2f})")
 
-        # 3. RSI bearish zone (1)
+        # 3. RSI bearish
         if vrsi < 45:
             score += 1
             reasons.append(f"RSI bearish zone ({vrsi:.1f})")
 
-        # 4. RSI not stretched (1)
+        # 4. RSI not stretched
         if 28 < vrsi < 45:
             score += 1
             reasons.append("RSI has room — not yet oversold")
 
-        # 5. MACD confirmation (1)
+        # 5. MACD bearish
         if vmh < 0 and vml < vms:
             score += 1
             reasons.append("MACD bearish confirmation")
 
-        # 6. Stoch RSI confirmation (1)
+        # 6. Stoch RSI bearish
         if kval is not None and dval is not None and kval < dval and kval < 50:
             score += 1
             reasons.append(f"Stoch RSI bearish crossover/strength ({kval:.1f})")
 
-        sl_dist = vatr * ATR_MULT
+        # 7. Bollinger Bands location
+        # Prefer price not chasing below lower band.
+        # Bonus if price is between lower band and middle band.
+        if price >= vbb_lower:
+            score += 1
+            if price <= vbb_mid:
+                reasons.append("Bollinger location supportive: price below mid-band but not overextended")
+            else:
+                reasons.append("Bollinger location acceptable: price not overextended below lower band")
 
         log.info(
-            "Score -> SELL:%d/6 | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f",
-            score, trend_status, vrsi, price, v21, v50, v200
+            "Score -> SELL:%d/7 | Trend:%s | RSI:%.1f | Price:%.2f | EMA21:%.2f EMA50:%.2f EMA200:%.2f | BBmid:%.2f BBup:%.2f BBlow:%.2f",
+            score, trend_status, vrsi, price, v21, v50, v200, vbb_mid, vbb_upper, vbb_lower
         )
 
         if score >= THRESHOLD:
@@ -367,10 +409,13 @@ def analyse(candles):
                 "tp1": round(entry - sl_dist * TP1_RATIO, 2),
                 "tp2": round(entry - sl_dist * TP2_RATIO, 2),
                 "score": score,
-                "max_score": 6,
+                "max_score": 7,
                 "reasons": reasons,
                 "atr": round(vatr, 2),
                 "rsi": round(vrsi, 1),
+                "bb_mid": round(vbb_mid, 2),
+                "bb_upper": round(vbb_upper, 2),
+                "bb_lower": round(vbb_lower, 2),
             }
 
     return None
@@ -407,6 +452,8 @@ def format_signal(sig, ts):
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Confluence :</b> {filled}{empty}  {sig['score']}/{sig['max_score']}\n"
         f"<b>RSI :</b> {sig['rsi']}    <b>ATR :</b> {sig['atr']}\n"
+        f"<b>BB Mid :</b> <code>{sig['bb_mid']}</code>    <b>BB Upper :</b> <code>{sig['bb_upper']}</code>\n"
+        f"<b>BB Lower :</b> <code>{sig['bb_lower']}</code>\n"
         f"\n<b>📊 Analysis:</b>\n{reasons}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>🕐 {ts} UTC  |  Timeframe: 15m</i>\n"
@@ -451,11 +498,11 @@ def bot_loop():
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📈 Pair: XAU/USD  |  Timeframe: 15m\n"
         "🔍 Scanning on each 15-minute candle close\n"
-        "⚙️ Trend-following mode enabled\n"
+        "⚙️ Trend-following mode with Bollinger Band entry filter enabled\n"
         "📦 Data bars loaded: 250 (EMA200-ready)\n"
         "💬 Daily status update sent every morning at 08:00 UTC\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Indicators: EMA21/50/200 · RSI · MACD · StochRSI · ATR</i>"
+        "<i>Indicators: EMA21/50/200 · RSI · MACD · StochRSI · Bollinger Bands · ATR</i>"
     )
 
     while True:
@@ -473,9 +520,9 @@ def bot_loop():
                     f"✅ Bot is alive and scanning\n"
                     f"💰 XAU/USD current price: <code>{latest_price:.2f}</code>\n"
                     f"🔍 Scans completed today: {_scan_count}\n"
-                    f"⚙️ Threshold: {THRESHOLD}/6  |  TF: 15m\n"
+                    f"⚙️ Threshold: {THRESHOLD}/7  |  TF: 15m\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<i>Next signal fires when trend and confluence align</i>"
+                    f"<i>Next signal fires when trend, momentum and Bollinger location align</i>"
                 )
                 _last_hb_date = today_str
                 _scan_count = 0
