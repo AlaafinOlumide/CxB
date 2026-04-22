@@ -35,7 +35,7 @@ MIN_BARS    = 250
 TP1_RATIO   = 1.5
 TP2_RATIO   = 3.0
 ATR_MULT    = 1.2
-THRESHOLD   = 5   # out of 7
+THRESHOLD   = 4   # out of 7
 
 logging.basicConfig(
     level=logging.INFO,
