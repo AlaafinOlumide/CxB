@@ -3,7 +3,7 @@ XAUUSD Signal Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Data      : TwelveData  (free: 8 req/min, 800/day)
 Signals   : Telegram
-Hosting   : Render (free web service + keep-alive)
+Hosting   : Render (web service + keep-alive)
 Strategy  : Trend-following confluence bot
             Bias from EMA21/50/200
             Entry confirmation from RSI + MACD + StochRSI + Bollinger Bands + ATR
