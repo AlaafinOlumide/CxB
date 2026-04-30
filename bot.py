@@ -457,7 +457,6 @@ def format_signal(sig, ts):
         f"\n<b>📊 Analysis:</b>\n{reasons}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>🕐 {ts} UTC  |  Timeframe: 15m</i>\n"
-        f"<i>⚠️ Educational purposes only. Manage your risk.</i>"
     )
 
 # ─── DUPLICATE GUARD ───────────────────────────────────────────────────────────
