@@ -1,20 +1,27 @@
 # XAUUSD Twelve Data → Telegram Signal Bot
 
-Signal-only bot for XAUUSD based on the rule set we built from your screenshots:
+Signal-only bot for XAUUSD. It does **not** place trades.
 
-**Output format**
-- Best Scenario
-- Best Lot Size
-- Entry
-- Take Profit
-- Stop Loss
-- Key Points
-- Why this bias
-- What can invalidate this bias
+## Improved version
 
-It does **not** place trades. It sends Telegram alerts only.
+This version improves the previous bot by:
 
-## Strategy summary
+- Starting the background signal loop correctly under `gunicorn main:app` on Render.
+- Using only **closed M5 and M15 candles**, not forming candles.
+- Sending fewer Telegram alerts using score-based filtering.
+- Using your exact signal format:
+  - Best Scenario
+  - Entry
+  - Take Profit
+  - Stop Loss
+  - Best Lot Size
+  - Key Points
+  - Why this bias
+  - What can invalidate this bias
+- Adding `/test-telegram` and `/run-once` routes.
+- Calculating lot size from stop distance and max risk per trade.
+
+## Strategy
 
 Timeframes:
 - M5 trigger
@@ -25,82 +32,79 @@ Indicators:
 - RSI 14
 - Stochastic 5,3,3
 
-Core rules:
-- BUY only when M5 and M15 align bullish.
-- SELL only when M5 and M15 align bearish.
-- If they conflict, WAIT.
-- Avoid chasing price at upper/lower Bollinger Band extremes.
-- Use prop-account friendly lot suggestions: 0.20 normal, 0.25 aggressive, 0.30 max.
+Scoring:
+- BUY or SELL needs at least 4/6 alignment.
+- 5/6 = A-
+- 6/6 = A
+- Anything weaker = WAIT.
 
-## Twelve Data free-plan friendly polling
+Minimum alignment:
+- M15 must not fight the trade.
+- Candle close confirmation required.
+- RSI must support direction.
+- Stochastic must support direction.
+- Avoid chasing upper/lower Bollinger Band extremes.
 
-Default polling is every 300 seconds / 5 minutes.
+## Render setup
 
-Each cycle calls:
-- M5 candles
-- M15 candles
-
-That is around 576 calls/day, designed to stay under the common Twelve Data free allowance of about 800/day.
-
-## Telegram setup
-
-1. Open Telegram and message `@BotFather`.
-2. Create a bot with `/newbot`.
-3. Copy the bot token.
-4. Send a message to your bot, or add it to a channel/group.
-5. Get your chat ID using a bot like `@userinfobot`, or by calling Telegram `getUpdates`.
-
-## Render deployment
-
-### Option A: Blueprint
-1. Push this folder to GitHub.
-2. In Render, choose **New → Blueprint**.
-3. Select the repo.
-4. Render reads `render.yaml`.
-5. Add secrets:
-   - `TWELVE_DATA_API_KEY`
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-
-### Option B: Manual Web Service
-1. New → Web Service.
-2. Build command:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Start command:
-   ```bash
-   python main.py
-   ```
-4. Add the same environment variables.
-
-## Important Render note
-
-For true 24/7, use a paid Render web service or worker.
-Render free web services can spin down after inactivity, so the bot may stop polling while asleep.
-
-If you still use the free web service, you can use an external uptime ping to call:
-
-```text
-https://your-service.onrender.com/health
+Root Directory:
+```bash
+xauusd_signal_bot
 ```
 
-every 10 minutes, but the more reliable solution is a paid always-on service.
-
-## Environment variables
-
-See `.env.example`.
-
-## Local run
-
+Build Command:
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
-python main.py
 ```
 
-The web server runs on `/`, `/health`, and `/last`.
+Start Command:
+```bash
+gunicorn main:app
+```
 
-## Disclaimer
+Python:
+```bash
+3.12.8
+```
 
-This is a signal tool, not financial advice. Test in paper mode first and respect Equity Edge drawdown rules.
+## Required environment variables
+
+```bash
+TWELVE_DATA_API_KEY=your_key
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+## Recommended environment variables
+
+```bash
+SYMBOL=XAU/USD
+POLL_SECONDS=300
+OUTPUTSIZE=120
+ACCOUNT_SIZE=50000
+DAILY_TARGET_MIN=250
+DAILY_TARGET_MAX=350
+MAX_RISK_PER_TRADE=120
+NORMAL_LOT=0.15
+AGGRESSIVE_LOT=0.25
+MAX_LOT=0.30
+SIGNAL_COOLDOWN_MINUTES=30
+SEND_WAIT_SIGNALS=false
+SEND_STARTUP_MESSAGE=true
+PYTHON_VERSION=3.12.8
+```
+
+## Useful routes
+
+```text
+/health
+/last
+/run-once
+/test-telegram
+```
+
+Use `/test-telegram` first to confirm Telegram connection.
+
+## Important
+
+This is a signal tool, not financial advice. Test on demo/paper first. Respect prop-firm drawdown rules.
