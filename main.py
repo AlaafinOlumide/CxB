@@ -14,8 +14,10 @@ state = {
     "last_signal": None,
     "last_sent_signature": None,
     "last_sent_at": None,
+    "worker_started": False,
     "errors": [],
 }
+_worker_lock = threading.Lock()
 
 
 def should_send(sig) -> bool:
@@ -31,7 +33,8 @@ def should_send(sig) -> bool:
     return True
 
 
-def run_once():
+def run_once(send=True):
+    print("Fetching XAUUSD M5 and M15 closed candles...")
     m5 = fetch_ohlc("5min")
     m15 = fetch_ohlc("15min")
     sig = build_signal(m5, m15)
@@ -42,34 +45,51 @@ def run_once():
     state["last_signal"] = {
         "direction": sig.direction,
         "confidence": sig.confidence,
+        "score": sig.score,
         "signature": sig.signature,
         "message": msg,
     }
 
-    if should_send(sig):
+    if send and should_send(sig):
         send_telegram(msg)
         state["last_sent_signature"] = sig.signature
         state["last_sent_at"] = now
-
-    print(f"[{now}] {sig.direction} {sig.confidence} {sig.signature}")
+        print(f"Telegram sent: {sig.direction} {sig.confidence} {sig.signature}")
+    else:
+        print(f"No Telegram send: {sig.direction} {sig.confidence} {sig.signature}")
+    return sig
 
 
 def worker():
     if settings.SEND_STARTUP_MESSAGE:
-        send_telegram("✅ XAUUSD signal bot started. Data: Twelve Data. Mode: Telegram signals only.")
+        send_telegram("✅ XAUUSD signal bot started. Format: Best Scenario, Entry, TP, SL, Key Points, Bias, Invalidation. Using closed M5/M15 candles only.")
     while True:
         try:
-            run_once()
+            run_once(send=True)
         except Exception as e:
             err = f"{datetime.now(timezone.utc).isoformat()} - {type(e).__name__}: {e}"
             print(err)
             state["errors"] = (state.get("errors", []) + [err])[-10:]
+            if settings.SEND_ERROR_MESSAGES:
+                try:
+                    send_telegram(f"⚠️ XAUUSD bot error:\n{err}")
+                except Exception:
+                    pass
         time.sleep(settings.POLL_SECONDS)
+
+
+def start_worker_once():
+    with _worker_lock:
+        if not state["worker_started"]:
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            state["worker_started"] = True
+            print("Background signal worker started")
 
 
 @app.route("/")
 def home():
-    return "XAUUSD Signal Bot is running. Use /health or /last"
+    return "XAUUSD Signal Bot is running. Use /health, /last, /run-once, /test-telegram"
 
 
 @app.route("/health")
@@ -82,7 +102,23 @@ def last():
     return jsonify(state.get("last_signal") or {})
 
 
+@app.route("/run-once")
+def run_once_route():
+    try:
+        sig = run_once(send=True)
+        return jsonify({"ok": True, "direction": sig.direction, "confidence": sig.confidence, "score": sig.score})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+
+
+@app.route("/test-telegram")
+def test_telegram():
+    send_telegram("✅ Telegram test successful. XAUUSD signal bot is connected.")
+    return jsonify({"ok": True, "message": "Telegram test sent"})
+
+
+# Important: Gunicorn imports this module, so start the worker on import.
+start_worker_once()
+
 if __name__ == "__main__":
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
     app.run(host="0.0.0.0", port=settings.PORT)
