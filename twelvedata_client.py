@@ -1,11 +1,16 @@
 import requests
 import pandas as pd
+from datetime import datetime, timezone
 from config import settings
 
 BASE_URL = "https://api.twelvedata.com/time_series"
 
 class TwelveDataError(RuntimeError):
     pass
+
+
+def _interval_minutes(interval: str) -> int:
+    return {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "1h": 60}.get(interval, 5)
 
 
 def fetch_ohlc(interval: str) -> pd.DataFrame:
@@ -37,4 +42,12 @@ def fetch_ohlc(interval: str) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["open", "high", "low", "close"])
     df = df.sort_values("datetime").reset_index(drop=True)
+
+    # Use only fully closed candles. Twelve Data can include the currently-forming candle.
+    minutes = _interval_minutes(interval)
+    now = datetime.now(timezone.utc)
+    cutoff = now - pd.Timedelta(minutes=minutes)
+    df = df[df["datetime"] <= cutoff].reset_index(drop=True)
+    if len(df) < 50:
+        raise TwelveDataError(f"Not enough closed candles for {interval}. Got {len(df)}")
     return df
