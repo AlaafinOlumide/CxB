@@ -4,7 +4,7 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: gunicorn main:app
     envVars:
       - key: SYMBOL
         value: XAU/USD
@@ -19,11 +19,15 @@ services:
       - key: DAILY_TARGET_MAX
         value: 350
       - key: NORMAL_LOT
-        value: 0.20
+        value: 0.15
       - key: AGGRESSIVE_LOT
         value: 0.25
       - key: MAX_LOT
         value: 0.30
+      - key: MAX_RISK_PER_TRADE
+        value: 120
+      - key: PYTHON_VERSION
+        value: 3.12.8
       - key: SIGNAL_COOLDOWN_MINUTES
         value: 20
       - key: SEND_WAIT_SIGNALS
