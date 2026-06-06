@@ -10,6 +10,7 @@ Direction = Literal["BUY", "SELL", "WAIT"]
 class Signal:
     direction: Direction
     confidence: str
+    score: int
     lot_size: float
     entry: str
     take_profit: str
@@ -32,6 +33,44 @@ def _latest(df: pd.DataFrame):
     return df.iloc[-1], df.iloc[-2]
 
 
+def _cross_up(c, p, k="stoch_k", d="stoch_d") -> bool:
+    return float(p[k]) <= float(p[d]) and float(c[k]) > float(c[d])
+
+
+def _cross_down(c, p, k="stoch_k", d="stoch_d") -> bool:
+    return float(p[k]) >= float(p[d]) and float(c[k]) < float(c[d])
+
+
+def _bullish_candle(c) -> bool:
+    body = float(c.close) - float(c.open)
+    rng = max(float(c.high) - float(c.low), 0.01)
+    return body > 0 and body / rng >= 0.35
+
+
+def _bearish_candle(c) -> bool:
+    body = float(c.open) - float(c.close)
+    rng = max(float(c.high) - float(c.low), 0.01)
+    return body > 0 and body / rng >= 0.35
+
+
+def _lot_for_risk(entry: float, sl: float, confidence: str) -> float:
+    stop_points = max(abs(entry - sl), 0.01)
+    raw = settings.MAX_RISK_PER_TRADE / (stop_points * settings.DOLLARS_PER_1_00_LOT_PER_POINT)
+    cap = settings.AGGRESSIVE_LOT if confidence.startswith("A") else settings.NORMAL_LOT
+    lot = min(raw, cap, settings.MAX_LOT)
+    return max(0.01, round(lot, 2))
+
+
+def _confidence(score: int) -> str:
+    if score >= 6:
+        return "A"
+    if score == 5:
+        return "A-"
+    if score == 4:
+        return "B+"
+    return "No Trade"
+
+
 def build_signal(m5_raw: pd.DataFrame, m15_raw: pd.DataFrame) -> Signal:
     m5 = add_indicators(m5_raw)
     m15 = add_indicators(m15_raw)
@@ -39,109 +78,130 @@ def build_signal(m5_raw: pd.DataFrame, m15_raw: pd.DataFrame) -> Signal:
     c15, p15 = _latest(m15)
 
     price = float(c5.close)
-    atr_like = max(6.0, abs(float(c5.bb_upper) - float(c5.bb_lower)) / 2)
+    bb_width = max(float(c5.bb_upper) - float(c5.bb_lower), 1.0)
+    buffer = max(2.0, bb_width * 0.18)
 
-    # Trend + momentum checks based on your manual confirmation rules
     m15_bull = c15.close > c15.bb_mid and c15.rsi > 50
     m15_bear = c15.close < c15.bb_mid and c15.rsi < 50
-    m5_bull = c5.close > c5.bb_mid and c5.rsi > 50 and c5.stoch_k > c5.stoch_d
-    m5_bear = c5.close < c5.bb_mid and c5.rsi < 50 and c5.stoch_k < c5.stoch_d
+    m15_recovering = c15.rsi > p15.rsi and c15.close >= p15.close
+    m15_weakening = c15.rsi < p15.rsi and c15.close <= p15.close
 
-    near_upper = c5.close >= c5.bb_upper * 0.998
-    near_lower = c5.close <= c5.bb_lower * 1.002
+    stoch_up = c5.stoch_k > c5.stoch_d and c5.stoch_k > p5.stoch_k
+    stoch_down = c5.stoch_k < c5.stoch_d and c5.stoch_k < p5.stoch_k
+    fresh_stoch_buy = _cross_up(c5, p5) or (stoch_up and 20 <= c5.stoch_k <= 75)
+    fresh_stoch_sell = _cross_down(c5, p5) or (stoch_down and 25 <= c5.stoch_k <= 80)
 
-    # BUY: M15 not bearish + M5 reclaim momentum, preferably after pullback/hold.
-    if m15_bull and m5_bull and not near_upper:
-        entry = price
-        sl = min(float(c5.bb_mid), price - atr_like * 0.75)
-        risk = entry - sl
-        tp1 = entry + max(6.0, risk * 1.0)
-        tp2 = entry + max(10.0, risk * 1.7)
+    above_mid = c5.close > c5.bb_mid
+    below_mid = c5.close < c5.bb_mid
+    near_upper = c5.close >= c5.bb_upper - 1.0
+    near_lower = c5.close <= c5.bb_lower + 1.0
+
+    buy_score = 0
+    buy_points = []
+    if m15_bull or (not m15_bear and m15_recovering):
+        buy_score += 1; buy_points.append("M15 bullish/recovering")
+    if above_mid:
+        buy_score += 1; buy_points.append("M5 closed above Bollinger midline")
+    if c5.rsi > 50 and c5.rsi > p5.rsi:
+        buy_score += 1; buy_points.append(f"M5 RSI {_fmt(c5.rsi)} above 50 and rising")
+    if fresh_stoch_buy:
+        buy_score += 1; buy_points.append("Stochastic bullish cross/momentum")
+    if _bullish_candle(c5):
+        buy_score += 1; buy_points.append("Bullish candle close confirmed")
+    if not near_upper:
+        buy_score += 1; buy_points.append("Not chasing upper Bollinger Band")
+
+    sell_score = 0
+    sell_points = []
+    if m15_bear or (not m15_bull and m15_weakening):
+        sell_score += 1; sell_points.append("M15 bearish/weakening")
+    if below_mid:
+        sell_score += 1; sell_points.append("M5 closed below Bollinger midline")
+    if c5.rsi < 50 and c5.rsi < p5.rsi:
+        sell_score += 1; sell_points.append(f"M5 RSI {_fmt(c5.rsi)} below 50 and falling")
+    if fresh_stoch_sell:
+        sell_score += 1; sell_points.append("Stochastic bearish cross/momentum")
+    if _bearish_candle(c5):
+        sell_score += 1; sell_points.append("Bearish candle close confirmed")
+    if not near_lower:
+        sell_score += 1; sell_points.append("Not chasing lower Bollinger Band")
+
+    # Minimum alignment: 4/6; ideal A setup: 5-6/6. If conflict or weak score, WAIT.
+    if buy_score >= 4 and buy_score > sell_score and not m15_bear:
+        confidence = _confidence(buy_score)
+        entry_low = price
+        entry_high = price + 2.0
+        sl = min(float(c5.bb_mid) - 1.5, price - buffer)
+        risk = price - sl
+        tp1 = price + max(5.0, risk * 1.0)
+        tp2 = price + max(9.0, risk * 1.8)
+        lot = _lot_for_risk(price, sl, confidence)
         return Signal(
             direction="BUY",
-            confidence="A-" if c15.rsi > 55 else "B+",
-            lot_size=settings.NORMAL_LOT if c15.rsi < 62 else min(settings.AGGRESSIVE_LOT, settings.MAX_LOT),
-            entry=f"{_fmt(entry)} after candle close/hold above BB midline",
+            confidence=confidence,
+            score=buy_score,
+            lot_size=lot,
+            entry=f"{_fmt(entry_low)} - {_fmt(entry_high)} after candle close/hold",
             take_profit=f"TP1 {_fmt(tp1)} | TP2 {_fmt(tp2)}",
             stop_loss=_fmt(sl),
-            key_points=[
-                f"M15 RSI {_fmt(c15.rsi)} above 50",
-                "M5 and M15 aligned bullish",
-                "Price above Bollinger midline",
-                "Stochastic crossing upward",
-            ],
-            why="Momentum has shifted bullish across M5 and M15, with price holding above the Bollinger midline rather than rejecting.",
-            invalidation=f"M5 closes back below {_fmt(sl)} or RSI loses 50.",
-            signature=f"BUY-{c5.datetime}-{round(price)}",
+            key_points=buy_points,
+            why="M5 trigger is bullish and M15 is not fighting the trade. Price has reclaimed structure instead of rejecting immediately.",
+            invalidation=f"Bias fails if M5 closes below {_fmt(sl)} or RSI drops back under 50.",
+            signature=f"BUY-{c5.datetime.strftime('%Y%m%d%H%M')}-{round(price)}",
         )
 
-    # SELL: M15 weak + M5 rejecting/continuing down. Avoid chasing far outside lower band.
-    if m15_bear and m5_bear and not near_lower:
-        entry = price
-        sl = max(float(c5.bb_mid), price + atr_like * 0.75)
-        risk = sl - entry
-        tp1 = entry - max(6.0, risk * 1.0)
-        tp2 = entry - max(10.0, risk * 1.7)
+    if sell_score >= 4 and sell_score > buy_score and not m15_bull:
+        confidence = _confidence(sell_score)
+        entry_low = price - 2.0
+        entry_high = price
+        sl = max(float(c5.bb_mid) + 1.5, price + buffer)
+        risk = sl - price
+        tp1 = price - max(5.0, risk * 1.0)
+        tp2 = price - max(9.0, risk * 1.8)
+        lot = _lot_for_risk(price, sl, confidence)
         return Signal(
             direction="SELL",
-            confidence="A-" if c15.rsi < 45 else "B+",
-            lot_size=settings.NORMAL_LOT if c15.rsi > 38 else min(settings.AGGRESSIVE_LOT, settings.MAX_LOT),
-            entry=f"{_fmt(entry)} after bearish candle close/retest failure",
+            confidence=confidence,
+            score=sell_score,
+            lot_size=lot,
+            entry=f"{_fmt(entry_low)} - {_fmt(entry_high)} after rejection/bearish close",
             take_profit=f"TP1 {_fmt(tp1)} | TP2 {_fmt(tp2)}",
             stop_loss=_fmt(sl),
-            key_points=[
-                f"M15 RSI {_fmt(c15.rsi)} below 50",
-                "M5 and M15 aligned bearish",
-                "Price below Bollinger midline",
-                "Stochastic crossing downward",
-            ],
-            why="Bearish structure remains in control, with price below the Bollinger midline and momentum confirming continuation.",
-            invalidation=f"M5 closes back above {_fmt(sl)} or RSI reclaims 50.",
-            signature=f"SELL-{c5.datetime}-{round(price)}",
+            key_points=sell_points,
+            why="M5 trigger is bearish and M15 is not fighting the trade. Price remains below structure with momentum confirming continuation.",
+            invalidation=f"Bias fails if M5 closes above {_fmt(sl)} or RSI reclaims 50.",
+            signature=f"SELL-{c5.datetime.strftime('%Y%m%d%H%M')}-{round(price)}",
         )
 
-    # Oversold bounce caution: wait rather than automatic buy.
     key = [
-        f"M5 RSI {_fmt(c5.rsi)}, M15 RSI {_fmt(c15.rsi)}",
+        f"Buy score {buy_score}/6 | Sell score {sell_score}/6",
+        f"M5 RSI {_fmt(c5.rsi)} | M15 RSI {_fmt(c15.rsi)}",
         f"M5 stoch K/D {_fmt(c5.stoch_k)}/{_fmt(c5.stoch_d)}",
-        "M5 and M15 not fully aligned",
-        "Market is in transition/chop or extended near a band",
+        "Minimum alignment not met or M5/M15 conflict",
     ]
-
-    if m15_bear and near_lower:
-        why = "Bearish pressure is strong, but price is extended near the lower Bollinger Band. Chasing sells here risks selling the low. Wait for retracement rejection."
-        invalid = f"A clean M5/M15 reclaim above {_fmt(c5.bb_mid)} with RSI above 50 can shift bias bullish."
-    elif m15_bull and near_upper:
-        why = "Bullish pressure exists, but price is extended near the upper Bollinger Band. Chasing buys here risks buying the top. Wait for pullback hold."
-        invalid = f"A clean M5 close below {_fmt(c5.bb_mid)} with RSI below 50 can shift bias bearish."
-    else:
-        why = "Current candles do not give enough confirmation. Wait for M5 and M15 alignment before entering."
-        invalid = "Bias becomes tradable only when candle closes confirm above/below structure with RSI and stochastic agreement."
-
     return Signal(
         direction="WAIT",
         confidence="No Trade",
+        score=max(buy_score, sell_score),
         lot_size=0.0,
         entry="No entry yet",
         take_profit="N/A",
         stop_loss="N/A",
         key_points=key,
-        why=why,
-        invalidation=invalid,
-        signature=f"WAIT-{c5.datetime}-{round(price)}",
+        why="The setup does not meet minimum alignment. Waiting protects the prop account from chop, fakeouts, and emotional entries.",
+        invalidation="Becomes tradable only when candle close, RSI, stochastic, Bollinger midline and M15 structure align.",
+        signature=f"WAIT-{c5.datetime.strftime('%Y%m%d%H%M')}-{round(price)}",
     )
 
 
 def format_signal(sig: Signal) -> str:
-    kp = "\n".join(f"- {x}" for x in sig.key_points)
+    kp = "\n".join(f"• {x}" for x in sig.key_points)
     lot = "No trade" if sig.direction == "WAIT" else f"{sig.lot_size:.2f} lot"
-    return f"""<b>XAUUSD Signal</b>
+    emoji = "🟢" if sig.direction == "BUY" else "🔴" if sig.direction == "SELL" else "⚪"
+    return f"""{emoji} <b>XAUUSD SIGNAL</b>
 
 <b>Best Scenario</b>
-{sig.direction} ({sig.confidence})
-
-<b>Best Lot Size</b>
-{lot}
+{sig.direction} ({sig.confidence} | Score {sig.score}/6)
 
 <b>Entry</b>
 {sig.entry}
@@ -151,6 +211,9 @@ def format_signal(sig: Signal) -> str:
 
 <b>Stop Loss</b>
 {sig.stop_loss}
+
+<b>Best Lot Size</b>
+{lot}
 
 <b>Key Points</b>
 {kp}
