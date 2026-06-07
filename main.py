@@ -1,5 +1,8 @@
-import os, time, threading
+import os
+import time
+import threading
 from datetime import datetime, timezone
+
 import requests
 import pandas as pd
 from flask import Flask, jsonify
@@ -11,19 +14,20 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 300))
 
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 300))
 MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", 15))
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 20))
-MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 4))
-MIN_RISK_REWARD = float(os.getenv("MIN_RISK_REWARD", 1.5))
+MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 3))
+
+RISK_PER_TRADE_USD = float(os.getenv("RISK_PER_TRADE_USD", 100))
+MAX_LOT_SIZE = float(os.getenv("MAX_LOT_SIZE", 0.50))
 
 state = {
     "last_signal_time": None,
-    "last_signal_side": None,
+    "last_candle_time": None,
     "signals_today": 0,
     "current_day": datetime.now(timezone.utc).date(),
-    "last_candle_time": None,
 }
 
 
@@ -41,8 +45,8 @@ def send_telegram(message):
         "text": message,
         "parse_mode": "HTML",
     }
-    r = requests.post(url, json=payload, timeout=20)
-    return r.json()
+    response = requests.post(url, json=payload, timeout=20)
+    return response.json()
 
 
 def get_data(interval):
@@ -54,7 +58,8 @@ def get_data(interval):
         "apikey": TWELVE_DATA_API_KEY,
     }
 
-    data = requests.get(url, params=params, timeout=20).json()
+    response = requests.get(url, params=params, timeout=20)
+    data = response.json()
 
     if "values" not in data:
         raise Exception(f"Twelve Data error: {data}")
@@ -73,8 +78,8 @@ def get_data(interval):
 def indicators(df):
     df["bb_mid"] = df["close"].rolling(20).mean()
     df["bb_std"] = df["close"].rolling(20).std()
-    df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
-    df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
+    df["bb_upper"] = df["bb_mid"] + (2 * df["bb_std"])
+    df["bb_lower"] = df["bb_mid"] - (2 * df["bb_std"])
 
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
@@ -90,145 +95,210 @@ def indicators(df):
     return df.dropna().reset_index(drop=True)
 
 
-def classify_signal(score):
-    if score >= 7:
-        return "🔥 A+ SIGNAL", "Execution grade", "0.30–0.50 lots"
+def grade_from_score(score):
     if score >= 6:
-        return "⚡ A SIGNAL", "Tradable", "0.20–0.30 lots"
-    return "📋 B WATCHLIST", "Wait for stronger confirmation", "0.10–0.20 lots"
+        return "A+"
+    if score == 5:
+        return "A-"
+    if score == 4:
+        return "B+"
+    if score == 3:
+        return "B"
+    return "NO TRADE"
+
+
+def quality_from_score(score):
+    if score >= 5:
+        return "EXECUTION GRADE"
+    if score == 4:
+        return "WATCH CLOSELY"
+    return "WAIT"
+
+
+def lot_size_from_score(score, stop_distance):
+    if score >= 6:
+        base_lot = 0.35
+    elif score == 5:
+        base_lot = 0.25
+    elif score == 4:
+        base_lot = 0.15
+    else:
+        base_lot = 0.00
+
+    if stop_distance <= 0:
+        return 0.00
+
+    risk_based_lot = RISK_PER_TRADE_USD / (stop_distance * 100)
+    final_lot = min(base_lot, risk_based_lot, MAX_LOT_SIZE)
+
+    return round(final_lot, 2)
+
+
+def not_chasing_extreme(side, candle):
+    if side == "BUY":
+        return candle["close"] < candle["bb_upper"]
+    if side == "SELL":
+        return candle["close"] > candle["bb_lower"]
+    return False
 
 
 def analyse():
     m5 = indicators(get_data("5min"))
     m15 = indicators(get_data("15min"))
 
-    c5 = m5.iloc[-2]      # closed candle
+    c5 = m5.iloc[-2]
     p5 = m5.iloc[-3]
     c15 = m15.iloc[-2]
 
-    price = c5["close"]
-    score_buy = 0
-    score_sell = 0
-    key_buy = []
-    key_sell = []
+    price = round(float(c5["close"]), 2)
 
-    # M15 alignment
-    if c15["close"] > c15["bb_mid"] and c15["rsi"] > 50:
-        score_buy += 2
-        key_buy.append("M15 bullish alignment")
-    if c15["close"] < c15["bb_mid"] and c15["rsi"] < 50:
-        score_sell += 2
-        key_sell.append("M15 bearish alignment")
+    buy_score = 0
+    sell_score = 0
+    buy_points = []
+    sell_points = []
 
-    # M5 Bollinger position
+    if c15["close"] > c15["bb_mid"] or c15["rsi"] >= 50:
+        buy_score += 1
+        buy_points.append("M15 bullish/recovering")
+
+    if c15["close"] < c15["bb_mid"] or c15["rsi"] <= 50:
+        sell_score += 1
+        sell_points.append("M15 bearish/weakening")
+
     if c5["close"] > c5["bb_mid"]:
-        score_buy += 1
-        key_buy.append("M5 price above BB midline")
+        buy_score += 1
+        buy_points.append("M5 closed above Bollinger midline")
+
     if c5["close"] < c5["bb_mid"]:
-        score_sell += 1
-        key_sell.append("M5 price below BB midline")
+        sell_score += 1
+        sell_points.append("M5 closed below Bollinger midline")
 
-    # RSI
     if c5["rsi"] > 50:
-        score_buy += 1
-        key_buy.append("M5 RSI above 50")
+        buy_score += 1
+        buy_points.append(f"M5 RSI {c5['rsi']:.2f} above 50 and rising")
+
     if c5["rsi"] < 50:
-        score_sell += 1
-        key_sell.append("M5 RSI below 50")
+        sell_score += 1
+        sell_points.append(f"M5 RSI {c5['rsi']:.2f} below 50 and falling")
 
-    # Stochastic cross
     if p5["stoch_k"] < p5["stoch_d"] and c5["stoch_k"] > c5["stoch_d"]:
-        score_buy += 2
-        key_buy.append("Stochastic bullish cross")
+        buy_score += 1
+        buy_points.append("Stochastic bullish cross confirmed")
+
     if p5["stoch_k"] > p5["stoch_d"] and c5["stoch_k"] < c5["stoch_d"]:
-        score_sell += 2
-        key_sell.append("Stochastic bearish cross")
+        sell_score += 1
+        sell_points.append("Stochastic bearish cross confirmed")
 
-    # Candle confirmation
     if c5["close"] > c5["open"]:
-        score_buy += 1
-        key_buy.append("Bullish closed candle")
+        buy_score += 1
+        buy_points.append("Bullish candle close confirmed")
+
     if c5["close"] < c5["open"]:
-        score_sell += 1
-        key_sell.append("Bearish closed candle")
+        sell_score += 1
+        sell_points.append("Bearish candle close confirmed")
 
-    if score_buy > score_sell and score_buy >= MIN_SIGNAL_SCORE:
+    if not_chasing_extreme("BUY", c5):
+        buy_score += 1
+        buy_points.append("Not chasing upper Bollinger Band")
+
+    if not_chasing_extreme("SELL", c5):
+        sell_score += 1
+        sell_points.append("Not chasing lower Bollinger Band")
+
+    if buy_score > sell_score:
         side = "BUY"
-        score = score_buy
-        key_points = key_buy
-        entry = round(price, 2)
-        sl = round(min(c5["low"], c5["bb_mid"]) - 2, 2)
-        risk = entry - sl
-        tp1 = round(entry + risk * 1.0, 2)
-        tp2 = round(entry + risk * 1.5, 2)
-        tp3 = round(entry + risk * 2.0, 2)
-        invalidation = f"Bias fails if M5 closes below {sl} or RSI drops back below 50."
-
-    elif score_sell > score_buy and score_sell >= MIN_SIGNAL_SCORE:
+        score = buy_score
+        key_points = buy_points
+    elif sell_score > buy_score:
         side = "SELL"
-        score = score_sell
-        key_points = key_sell
-        entry = round(price, 2)
-        sl = round(max(c5["high"], c5["bb_mid"]) + 2, 2)
-        risk = sl - entry
-        tp1 = round(entry - risk * 1.0, 2)
-        tp2 = round(entry - risk * 1.5, 2)
-        tp3 = round(entry - risk * 2.0, 2)
+        score = sell_score
+        key_points = sell_points
+    else:
+        side = "WAIT"
+        score = max(buy_score, sell_score)
+        key_points = [
+            "M5 and M15 are mixed",
+            "No clean directional edge",
+            "Waiting for stronger confirmation",
+        ]
+
+    if score < MIN_SIGNAL_SCORE:
+        side = "WAIT"
+
+    grade = grade_from_score(score)
+    quality = quality_from_score(score)
+
+    if side == "BUY":
+        emoji = "🟢"
+        entry_low = price
+        entry_high = round(price + 2, 2)
+        sl = round(min(float(c5["low"]), float(c5["bb_mid"])) - 2, 2)
+        stop_distance = entry_low - sl
+        tp1 = round(entry_low + stop_distance, 2)
+        tp2 = round(entry_low + (stop_distance * 1.8), 2)
+        entry_text = f"{entry_low} - {entry_high} after breakout/bullish close"
+        invalidation = f"Bias fails if M5 closes below {sl} or RSI drops back below 50."
+        why = "M5 trigger is bullish and M15 is not fighting the trade. Price remains above structure with momentum confirming continuation."
+
+    elif side == "SELL":
+        emoji = "🔴"
+        entry_low = price
+        entry_high = round(price + 2, 2)
+        sl = round(max(float(c5["high"]), float(c5["bb_mid"])) + 2, 2)
+        stop_distance = sl - entry_low
+        tp1 = round(entry_low - stop_distance, 2)
+        tp2 = round(entry_low - (stop_distance * 1.8), 2)
+        entry_text = f"{entry_low} - {entry_high} after rejection/bearish close"
         invalidation = f"Bias fails if M5 closes above {sl} or RSI reclaims 50."
+        why = "M5 trigger is bearish and M15 is not fighting the trade. Price remains below structure with momentum confirming continuation."
 
     else:
-        return None
+        emoji = "🟡"
+        entry_text = "No trade"
+        tp1 = "N/A"
+        tp2 = "N/A"
+        sl = "N/A"
+        stop_distance = 0
+        invalidation = "A confirmed M5 breakout or breakdown with M15 alignment."
+        why = "M5 and M15 are not sufficiently aligned. Current structure lacks enough confirmation for execution."
 
-    if risk <= 0:
-        return None
+    lot = lot_size_from_score(score, stop_distance)
+    lot_text = "No Trade" if side == "WAIT" or lot == 0 else f"{lot:.2f} lot"
 
-    rr = abs(tp3 - entry) / risk
-    if rr < MIN_RISK_REWARD:
-        return None
+    message = f"""{emoji} XAUUSD SIGNAL
 
-    label, quality, lot_size = classify_signal(score)
+Best Scenario
+{side} ({grade} | Score {score}/6)
 
-    message = f"""
-{label}
+Quality
+{quality}
 
-<b>XAUUSD SIGNAL</b>
+Entry
+{entry_text}
 
-<b>Best Scenario:</b> {side}
-<b>Quality:</b> {quality}
-<b>Score:</b> {score}/8
+Take Profit
+TP1 {tp1} | TP2 {tp2}
 
-<b>Entry:</b>
-{entry}
-
-<b>Take Profit:</b>
-TP1: {tp1}
-TP2: {tp2}
-TP3: {tp3}
-
-<b>Stop Loss:</b>
+Stop Loss
 {sl}
 
-<b>Suggested Lot Size:</b>
-{lot_size}
+Best Lot Size
+{lot_text}
 
-<b>Key Points:</b>
-""" + "\n".join([f"• {x}" for x in key_points]) + f"""
+Key Points
+""" + "\n".join([f"• {point}" for point in key_points]) + f"""
 
-<b>Why This Bias:</b>
-{side} bias is supported by M15 structure, M5 confirmation, RSI condition, stochastic direction, and closed candle momentum.
+Why this bias
+{why}
 
-<b>What Can Invalidate This Bias:</b>
+What can invalidate this bias
 {invalidation}
-
-<b>Prop Rule:</b>
-A+ = executable.
-A = tradable with caution.
-B = watchlist only unless manually confirmed.
 """
 
     return {
         "side": side,
         "score": score,
+        "quality": quality,
         "message": message,
         "candle_time": str(c5["time"]),
     }
@@ -249,8 +319,8 @@ def should_send(signal):
     now = datetime.now(timezone.utc)
 
     if state["last_signal_time"]:
-        minutes = (now - state["last_signal_time"]).total_seconds() / 60
-        if minutes < SIGNAL_COOLDOWN_MINUTES:
+        minutes_since_last = (now - state["last_signal_time"]).total_seconds() / 60
+        if minutes_since_last < SIGNAL_COOLDOWN_MINUTES:
             return False
 
     return True
@@ -262,21 +332,26 @@ def run_once():
     if should_send(signal):
         send_telegram(signal["message"])
         state["last_signal_time"] = datetime.now(timezone.utc)
-        state["last_signal_side"] = signal["side"]
-        state["signals_today"] += 1
         state["last_candle_time"] = signal["candle_time"]
+        state["signals_today"] += 1
         return signal
 
-    return {"status": "WAIT", "reason": "No valid signal or cooldown active"}
+    return {
+        "status": "WAIT",
+        "reason": "No valid signal, duplicate candle, cooldown active, or daily signal cap reached",
+    }
 
 
 def bot_loop():
     time.sleep(10)
+
     while True:
         try:
-            run_once()
-        except Exception as e:
-            print(f"Bot error: {e}", flush=True)
+            result = run_once()
+            print(result, flush=True)
+        except Exception as error:
+            print(f"Bot error: {error}", flush=True)
+
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -287,6 +362,8 @@ def home():
         "symbol": SYMBOL,
         "signals_today": state["signals_today"],
         "max_signals_per_day": MAX_SIGNALS_PER_DAY,
+        "cooldown_minutes": SIGNAL_COOLDOWN_MINUTES,
+        "min_signal_score": MIN_SIGNAL_SCORE,
     })
 
 
