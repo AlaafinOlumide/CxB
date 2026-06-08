@@ -2,6 +2,7 @@ import os
 import time
 import threading
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
@@ -16,23 +17,38 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 300))
-MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", 15))
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 20))
 MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 3))
+
+SCOUT_TIMEZONE = os.getenv("SCOUT_TIMEZONE", "Europe/London")
+
+SCOUT_WINDOWS = [
+    ("23:00", "03:00"),
+    ("07:00", "11:00"),
+    ("12:00", "17:00"),
+]
 
 state = {
     "last_signal_time": None,
     "last_candle_time": None,
-    "signals_today": 0,
-    "current_day": datetime.now(timezone.utc).date(),
 }
 
 
-def reset_daily_counter():
-    today = datetime.now(timezone.utc).date()
-    if state["current_day"] != today:
-        state["current_day"] = today
-        state["signals_today"] = 0
+def is_within_scouting_time():
+    now = datetime.now(ZoneInfo(SCOUT_TIMEZONE)).time()
+
+    for start_str, end_str in SCOUT_WINDOWS:
+        start = datetime.strptime(start_str, "%H:%M").time()
+        end = datetime.strptime(end_str, "%H:%M").time()
+
+        if start < end:
+            if start <= now <= end:
+                return True
+        else:
+            if now >= start or now <= end:
+                return True
+
+    return False
 
 
 def send_telegram(message):
@@ -294,12 +310,7 @@ What can invalidate this bias
 
 
 def should_send(signal):
-    reset_daily_counter()
-
     if not signal:
-        return False
-
-    if state["signals_today"] >= MAX_SIGNALS_PER_DAY:
         return False
 
     if signal["candle_time"] == state["last_candle_time"]:
@@ -316,18 +327,25 @@ def should_send(signal):
 
 
 def run_once():
+    if not is_within_scouting_time():
+        return {
+            "status": "OFF_SESSION",
+            "reason": "Outside scouting hours",
+            "scouting_windows": SCOUT_WINDOWS,
+            "timezone": SCOUT_TIMEZONE,
+        }
+
     signal = analyse()
 
     if should_send(signal):
         send_telegram(signal["message"])
         state["last_signal_time"] = datetime.now(timezone.utc)
         state["last_candle_time"] = signal["candle_time"]
-        state["signals_today"] += 1
         return signal
 
     return {
         "status": "WAIT",
-        "reason": "No valid signal, duplicate candle, cooldown active, or daily signal cap reached",
+        "reason": "No valid signal, duplicate candle, or cooldown active",
     }
 
 
@@ -349,8 +367,9 @@ def home():
     return jsonify({
         "status": "running",
         "symbol": SYMBOL,
-        "signals_today": state["signals_today"],
-        "max_signals_per_day": MAX_SIGNALS_PER_DAY,
+        "scout_timezone": SCOUT_TIMEZONE,
+        "scout_windows": SCOUT_WINDOWS,
+        "currently_scouting": is_within_scouting_time(),
         "cooldown_minutes": SIGNAL_COOLDOWN_MINUTES,
         "min_signal_score": MIN_SIGNAL_SCORE,
     })
