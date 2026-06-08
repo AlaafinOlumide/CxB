@@ -20,9 +20,6 @@ MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", 15))
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 20))
 MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 3))
 
-RISK_PER_TRADE_USD = float(os.getenv("RISK_PER_TRADE_USD", 100))
-MAX_LOT_SIZE = float(os.getenv("MAX_LOT_SIZE", 0.50))
-
 state = {
     "last_signal_time": None,
     "last_candle_time": None,
@@ -117,21 +114,13 @@ def quality_from_score(score):
 
 def lot_size_from_score(score, stop_distance):
     if score >= 6:
-        base_lot = 0.35
+        return 0.50
     elif score == 5:
-        base_lot = 0.25
+        return 0.25
     elif score == 4:
-        base_lot = 0.15
+        return 0.15
     else:
-        base_lot = 0.00
-
-    if stop_distance <= 0:
         return 0.00
-
-    risk_based_lot = RISK_PER_TRADE_USD / (stop_distance * 100)
-    final_lot = min(base_lot, risk_based_lot, MAX_LOT_SIZE)
-
-    return round(final_lot, 2)
 
 
 def not_chasing_extreme(side, candle):
