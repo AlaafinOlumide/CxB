@@ -34,6 +34,26 @@ state = {
 }
 
 
+def is_weekend_sleep():
+    now = datetime.now(ZoneInfo(SCOUT_TIMEZONE))
+    weekday = now.weekday()
+    current_time = now.time()
+
+    friday_sleep_start = datetime.strptime("22:00", "%H:%M").time()
+    sunday_sleep_end = datetime.strptime("22:00", "%H:%M").time()
+
+    if weekday == 4 and current_time >= friday_sleep_start:
+        return True
+
+    if weekday == 5:
+        return True
+
+    if weekday == 6 and current_time < sunday_sleep_end:
+        return True
+
+    return False
+
+
 def is_within_scouting_time():
     now = datetime.now(ZoneInfo(SCOUT_TIMEZONE)).time()
 
@@ -327,6 +347,14 @@ def should_send(signal):
 
 
 def run_once():
+    if is_weekend_sleep():
+        return {
+            "status": "SLEEPING",
+            "reason": "Weekend shutdown active",
+            "sleep_window": "Friday 22:00 to Sunday 22:00",
+            "timezone": SCOUT_TIMEZONE,
+        }
+
     if not is_within_scouting_time():
         return {
             "status": "OFF_SESSION",
@@ -370,6 +398,8 @@ def home():
         "scout_timezone": SCOUT_TIMEZONE,
         "scout_windows": SCOUT_WINDOWS,
         "currently_scouting": is_within_scouting_time(),
+        "weekend_sleep": "Friday 22:00 to Sunday 22:00",
+        "sleeping_now": is_weekend_sleep(),
         "cooldown_minutes": SIGNAL_COOLDOWN_MINUTES,
         "min_signal_score": MIN_SIGNAL_SCORE,
     })
