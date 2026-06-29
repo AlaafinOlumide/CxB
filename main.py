@@ -18,14 +18,14 @@ SYMBOL = os.getenv("SYMBOL", "XAU/USD")
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 300))
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 20))
-MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 3))
+MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 4))
 
 SCOUT_TIMEZONE = os.getenv("SCOUT_TIMEZONE", "Europe/London")
 
 SCOUT_WINDOWS = [
     ("23:00", "03:00"),
-    ("07:00", "11:00"),
-    ("12:00", "17:00"),
+    ("07:00", "10:00"),
+    ("13:30", "16:00"),
 ]
 
 state = {
@@ -39,16 +39,13 @@ def is_weekend_sleep():
     weekday = now.weekday()
     current_time = now.time()
 
-    friday_sleep_start = datetime.strptime("22:00", "%H:%M").time()
-    sunday_sleep_end = datetime.strptime("22:00", "%H:%M").time()
-
-    if weekday == 4 and current_time >= friday_sleep_start:
+    if weekday == 4 and current_time >= datetime.strptime("22:00", "%H:%M").time():
         return True
 
     if weekday == 5:
         return True
 
-    if weekday == 6 and current_time < sunday_sleep_end:
+    if weekday == 6 and current_time < datetime.strptime("22:00", "%H:%M").time():
         return True
 
     return False
@@ -148,7 +145,7 @@ def quality_from_score(score):
     return "WAIT"
 
 
-def lot_size_from_score(score, stop_distance):
+def lot_size_from_score(score):
     if score >= 6:
         return 0.50
     elif score == 5:
@@ -159,34 +156,63 @@ def lot_size_from_score(score, stop_distance):
         return 0.00
 
 
+def h1_bias(candle):
+    if candle["close"] > candle["bb_mid"] and candle["rsi"] >= 55:
+        return "BUY"
+
+    if candle["close"] < candle["bb_mid"] and candle["rsi"] <= 45:
+        return "SELL"
+
+    return "NEUTRAL"
+
+
 def not_chasing_extreme(side, candle):
     if side == "BUY":
         return candle["close"] < candle["bb_upper"]
+
     if side == "SELL":
         return candle["close"] > candle["bb_lower"]
+
     return False
 
 
 def analyse():
-    m5 = indicators(get_data("5min"))
+    h1 = indicators(get_data("1h"))
     m15 = indicators(get_data("15min"))
+    m5 = indicators(get_data("5min"))
 
+    c1 = h1.iloc[-2]
+    c15 = m15.iloc[-2]
     c5 = m5.iloc[-2]
     p5 = m5.iloc[-3]
-    c15 = m15.iloc[-2]
 
     price = round(float(c5["close"]), 2)
+    higher_tf_bias = h1_bias(c1)
 
     buy_score = 0
     sell_score = 0
     buy_points = []
     sell_points = []
 
-    if c15["close"] > c15["bb_mid"] or c15["rsi"] >= 50:
+    if higher_tf_bias == "BUY":
+        buy_score += 1
+        buy_points.append("H1 bullish: buyers control higher timeframe")
+        sell_points.append("H1 bullish: selling is blocked unless reversal confirms")
+
+    elif higher_tf_bias == "SELL":
+        sell_score += 1
+        sell_points.append("H1 bearish: sellers control higher timeframe")
+        buy_points.append("H1 bearish: buying is blocked unless reversal confirms")
+
+    else:
+        buy_points.append("H1 neutral")
+        sell_points.append("H1 neutral")
+
+    if c15["close"] > c15["bb_mid"] and c15["rsi"] >= 50:
         buy_score += 1
         buy_points.append("M15 bullish/recovering")
 
-    if c15["close"] < c15["bb_mid"] or c15["rsi"] <= 50:
+    if c15["close"] < c15["bb_mid"] and c15["rsi"] <= 50:
         sell_score += 1
         sell_points.append("M15 bearish/weakening")
 
@@ -230,25 +256,32 @@ def analyse():
         sell_score += 1
         sell_points.append("Not chasing lower Bollinger Band")
 
-    if buy_score > sell_score:
+    if higher_tf_bias == "BUY":
+        sell_score = 0
+
+    if higher_tf_bias == "SELL":
+        buy_score = 0
+
+    if buy_score > sell_score and buy_score >= MIN_SIGNAL_SCORE:
         side = "BUY"
-        score = buy_score
+        score = min(buy_score, 6)
         key_points = buy_points
-    elif sell_score > buy_score:
+
+    elif sell_score > buy_score and sell_score >= MIN_SIGNAL_SCORE:
         side = "SELL"
-        score = sell_score
+        score = min(sell_score, 6)
         key_points = sell_points
+
     else:
         side = "WAIT"
-        score = max(buy_score, sell_score)
+        score = max(min(buy_score, 6), min(sell_score, 6))
         key_points = [
-            "M5 and M15 are mixed",
-            "No clean directional edge",
-            "Waiting for stronger confirmation",
+            f"H1 bias: {higher_tf_bias}",
+            "M15 and M5 are not sufficiently aligned",
+            "No clean confirmation yet",
+            "Avoid fighting the higher timeframe trend",
+            "Wait for pullback and closed-candle confirmation",
         ]
-
-    if score < MIN_SIGNAL_SCORE:
-        side = "WAIT"
 
     grade = grade_from_score(score)
     quality = quality_from_score(score)
@@ -259,11 +292,13 @@ def analyse():
         entry_high = round(price + 2, 2)
         sl = round(min(float(c5["low"]), float(c5["bb_mid"])) - 2, 2)
         stop_distance = entry_low - sl
+
         tp1 = round(entry_low + stop_distance, 2)
         tp2 = round(entry_low + (stop_distance * 1.8), 2)
+
         entry_text = f"{entry_low} - {entry_high} after breakout/bullish close"
-        invalidation = f"Bias fails if M5 closes below {sl} or RSI drops back below 50."
-        why = "M5 trigger is bullish and M15 is not fighting the trade. Price remains above structure with momentum confirming continuation."
+        invalidation = f"Bias fails if M5 closes below {sl}, RSI drops below 50, or H1 loses bullish structure."
+        why = "H1 supports buying, M15 is not fighting the trade, and M5 has confirmed bullish momentum."
 
     elif side == "SELL":
         emoji = "🔴"
@@ -271,11 +306,13 @@ def analyse():
         entry_high = round(price + 2, 2)
         sl = round(max(float(c5["high"]), float(c5["bb_mid"])) + 2, 2)
         stop_distance = sl - entry_low
+
         tp1 = round(entry_low - stop_distance, 2)
         tp2 = round(entry_low - (stop_distance * 1.8), 2)
+
         entry_text = f"{entry_low} - {entry_high} after rejection/bearish close"
-        invalidation = f"Bias fails if M5 closes above {sl} or RSI reclaims 50."
-        why = "M5 trigger is bearish and M15 is not fighting the trade. Price remains below structure with momentum confirming continuation."
+        invalidation = f"Bias fails if M5 closes above {sl}, RSI reclaims 50, or H1 turns bullish."
+        why = "H1 supports selling, M15 is not fighting the trade, and M5 has confirmed bearish momentum."
 
     else:
         emoji = "🟡"
@@ -283,11 +320,10 @@ def analyse():
         tp1 = "N/A"
         tp2 = "N/A"
         sl = "N/A"
-        stop_distance = 0
-        invalidation = "A confirmed M5 breakout or breakdown with M15 alignment."
-        why = "M5 and M15 are not sufficiently aligned. Current structure lacks enough confirmation for execution."
+        invalidation = "A confirmed H1, M15, and M5 alignment with closed-candle confirmation."
+        why = "The bot is protecting the account by avoiding counter-trend entries, weak confirmation, and emotional trades."
 
-    lot = lot_size_from_score(score, stop_distance)
+    lot = lot_size_from_score(score)
     lot_text = "No Trade" if side == "WAIT" or lot == 0 else f"{lot:.2f} lot"
 
     message = f"""{emoji} XAUUSD SIGNAL
@@ -324,6 +360,7 @@ What can invalidate this bias
         "side": side,
         "score": score,
         "quality": quality,
+        "h1_bias": higher_tf_bias,
         "message": message,
         "candle_time": str(c5["time"]),
     }
@@ -358,7 +395,7 @@ def run_once():
     if not is_within_scouting_time():
         return {
             "status": "OFF_SESSION",
-            "reason": "Outside scouting hours",
+            "reason": "Outside high-probability trading windows",
             "scouting_windows": SCOUT_WINDOWS,
             "timezone": SCOUT_TIMEZONE,
         }
@@ -395,6 +432,7 @@ def home():
     return jsonify({
         "status": "running",
         "symbol": SYMBOL,
+        "strategy": "H1 trend filter + M15 alignment + M5 confirmation",
         "scout_timezone": SCOUT_TIMEZONE,
         "scout_windows": SCOUT_WINDOWS,
         "currently_scouting": is_within_scouting_time(),
@@ -402,6 +440,12 @@ def home():
         "sleeping_now": is_weekend_sleep(),
         "cooldown_minutes": SIGNAL_COOLDOWN_MINUTES,
         "min_signal_score": MIN_SIGNAL_SCORE,
+        "lot_sizes": {
+            "A+": "0.50 lot",
+            "A-": "0.25 lot",
+            "B+": "0.15 lot",
+            "B/WAIT": "No Trade",
+        },
     })
 
 
