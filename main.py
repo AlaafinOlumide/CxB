@@ -122,6 +122,33 @@ def indicators(df):
     df["stoch_k"] = 100 * ((df["close"] - low14) / (high14 - low14))
     df["stoch_d"] = df["stoch_k"].rolling(3).mean()
 
+    # ATR
+    df["prev_close"] = df["close"].shift(1)
+    df["tr1"] = df["high"] - df["low"]
+    df["tr2"] = (df["high"] - df["prev_close"]).abs()
+    df["tr3"] = (df["low"] - df["prev_close"]).abs()
+    df["true_range"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
+    df["atr"] = df["true_range"].rolling(14).mean()
+
+    # ADX
+    df["up_move"] = df["high"] - df["high"].shift(1)
+    df["down_move"] = df["low"].shift(1) - df["low"]
+
+    df["+dm"] = df.apply(
+        lambda row: row["up_move"] if row["up_move"] > row["down_move"] and row["up_move"] > 0 else 0,
+        axis=1,
+    )
+
+    df["-dm"] = df.apply(
+        lambda row: row["down_move"] if row["down_move"] > row["up_move"] and row["down_move"] > 0 else 0,
+        axis=1,
+    )
+
+    df["+di"] = 100 * (df["+dm"].rolling(14).mean() / df["atr"])
+    df["-di"] = 100 * (df["-dm"].rolling(14).mean() / df["atr"])
+    df["dx"] = 100 * ((df["+di"] - df["-di"]).abs() / (df["+di"] + df["-di"]))
+    df["adx"] = df["dx"].rolling(14).mean()
+
     return df.dropna().reset_index(drop=True)
 
 
@@ -164,6 +191,46 @@ def h1_bias(candle):
         return "SELL"
 
     return "NEUTRAL"
+
+
+def momentum_strength(candle):
+    adx = candle["adx"]
+
+    if adx >= 35:
+        return "Very Strong"
+    elif adx >= 25:
+        return "Strong"
+    elif adx >= 20:
+        return "Medium"
+    else:
+        return "Weak"
+
+
+def exhaustion_risk(side, candle, prev_candle):
+    adx = candle["adx"]
+    rsi = candle["rsi"]
+    atr_now = candle["atr"]
+    atr_prev = prev_candle["atr"]
+
+    if side == "BUY":
+        if rsi >= 70 and candle["close"] >= candle["bb_upper"]:
+            return "High"
+        if adx >= 35 and rsi >= 65:
+            return "Medium"
+        if atr_now < atr_prev and rsi >= 65:
+            return "Medium"
+        return "Low"
+
+    if side == "SELL":
+        if rsi <= 30 and candle["close"] <= candle["bb_lower"]:
+            return "High"
+        if adx >= 35 and rsi <= 35:
+            return "Medium"
+        if atr_now < atr_prev and rsi <= 35:
+            return "Medium"
+        return "Low"
+
+    return "N/A"
 
 
 def not_chasing_extreme(side, candle):
@@ -256,6 +323,21 @@ def analyse():
         sell_score += 1
         sell_points.append("Not chasing lower Bollinger Band")
 
+    # ADX momentum strength
+    m_strength = momentum_strength(c5)
+
+    if c5["adx"] >= 20:
+        if buy_score > sell_score:
+            buy_score += 1
+            buy_points.append(f"ADX {c5['adx']:.2f}: momentum strength is {m_strength}")
+        elif sell_score > buy_score:
+            sell_score += 1
+            sell_points.append(f"ADX {c5['adx']:.2f}: momentum strength is {m_strength}")
+    else:
+        buy_points.append(f"ADX {c5['adx']:.2f}: weak/choppy momentum")
+        sell_points.append(f"ADX {c5['adx']:.2f}: weak/choppy momentum")
+
+    # H1 protection
     if higher_tf_bias == "BUY":
         sell_score = 0
 
@@ -279,12 +361,14 @@ def analyse():
             f"H1 bias: {higher_tf_bias}",
             "M15 and M5 are not sufficiently aligned",
             "No clean confirmation yet",
+            f"ADX {c5['adx']:.2f}: momentum strength is {m_strength}",
             "Avoid fighting the higher timeframe trend",
             "Wait for pullback and closed-candle confirmation",
         ]
 
     grade = grade_from_score(score)
     quality = quality_from_score(score)
+    exhaustion = exhaustion_risk(side, c5, p5)
 
     if side == "BUY":
         emoji = "🟢"
@@ -297,8 +381,8 @@ def analyse():
         tp2 = round(entry_low + (stop_distance * 1.8), 2)
 
         entry_text = f"{entry_low} - {entry_high} after breakout/bullish close"
-        invalidation = f"Bias fails if M5 closes below {sl}, RSI drops below 50, or H1 loses bullish structure."
-        why = "H1 supports buying, M15 is not fighting the trade, and M5 has confirmed bullish momentum."
+        invalidation = f"Bias fails if M5 closes below {sl}, RSI drops below 50, ADX weakens below 20, or H1 loses bullish structure."
+        why = "H1 supports buying, M15 is not fighting the trade, M5 confirms bullish momentum, and ADX shows whether the move has strength."
 
     elif side == "SELL":
         emoji = "🔴"
@@ -311,8 +395,8 @@ def analyse():
         tp2 = round(entry_low - (stop_distance * 1.8), 2)
 
         entry_text = f"{entry_low} - {entry_high} after rejection/bearish close"
-        invalidation = f"Bias fails if M5 closes above {sl}, RSI reclaims 50, or H1 turns bullish."
-        why = "H1 supports selling, M15 is not fighting the trade, and M5 has confirmed bearish momentum."
+        invalidation = f"Bias fails if M5 closes above {sl}, RSI reclaims 50, ADX weakens below 20, or H1 turns bullish."
+        why = "H1 supports selling, M15 is not fighting the trade, M5 confirms bearish momentum, and ADX shows whether the move has strength."
 
     else:
         emoji = "🟡"
@@ -320,8 +404,8 @@ def analyse():
         tp1 = "N/A"
         tp2 = "N/A"
         sl = "N/A"
-        invalidation = "A confirmed H1, M15, and M5 alignment with closed-candle confirmation."
-        why = "The bot is protecting the account by avoiding counter-trend entries, weak confirmation, and emotional trades."
+        invalidation = "A confirmed H1, M15, and M5 alignment with closed-candle confirmation and stronger ADX momentum."
+        why = "The bot is protecting the account by avoiding counter-trend entries, weak momentum, exhaustion zones, and emotional trades."
 
     lot = lot_size_from_score(score)
     lot_text = "No Trade" if side == "WAIT" or lot == 0 else f"{lot:.2f} lot"
@@ -333,6 +417,12 @@ Best Scenario
 
 Quality
 {quality}
+
+Momentum Strength
+{m_strength}
+
+Exhaustion Risk
+{exhaustion}
 
 Entry
 {entry_text}
@@ -361,6 +451,8 @@ What can invalidate this bias
         "score": score,
         "quality": quality,
         "h1_bias": higher_tf_bias,
+        "momentum_strength": m_strength,
+        "exhaustion_risk": exhaustion,
         "message": message,
         "candle_time": str(c5["time"]),
     }
@@ -432,7 +524,7 @@ def home():
     return jsonify({
         "status": "running",
         "symbol": SYMBOL,
-        "strategy": "H1 trend filter + M15 alignment + M5 confirmation",
+        "strategy": "H1 trend filter + M15 alignment + M5 confirmation + ADX/ATR momentum filter",
         "scout_timezone": SCOUT_TIMEZONE,
         "scout_windows": SCOUT_WINDOWS,
         "currently_scouting": is_within_scouting_time(),
