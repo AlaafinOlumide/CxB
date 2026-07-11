@@ -4,11 +4,15 @@ import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-import requests
 import pandas as pd
+import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
+
+# ============================================================
+# ENVIRONMENT SETTINGS
+# ============================================================
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -16,12 +20,28 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
 
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", 300))
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 20))
-MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", 4))
+POLL_INTERVAL_SECONDS = int(
+    os.getenv("POLL_INTERVAL_SECONDS", 300)
+)
 
-SCOUT_TIMEZONE = os.getenv("SCOUT_TIMEZONE", "Europe/London")
+SIGNAL_COOLDOWN_MINUTES = int(
+    os.getenv("SIGNAL_COOLDOWN_MINUTES", 45)
+)
 
+MIN_SIGNAL_SCORE = int(
+    os.getenv("MIN_SIGNAL_SCORE", 5)
+)
+
+MIN_ADX = float(
+    os.getenv("MIN_ADX", 23)
+)
+
+SCOUT_TIMEZONE = os.getenv(
+    "SCOUT_TIMEZONE",
+    "Europe/London"
+)
+
+# UK scouting windows
 SCOUT_WINDOWS = [
     ("23:00", "03:00"),
     ("07:00", "10:00"),
@@ -31,445 +51,1465 @@ SCOUT_WINDOWS = [
 state = {
     "last_signal_time": None,
     "last_candle_time": None,
+    "last_signal_side": None,
 }
 
 
+# ============================================================
+# SESSION CONTROL
+# ============================================================
+
+def london_now():
+    return datetime.now(
+        ZoneInfo(SCOUT_TIMEZONE)
+    )
+
+
 def is_weekend_sleep():
-    now = datetime.now(ZoneInfo(SCOUT_TIMEZONE))
+    """
+    Bot sleeps:
+    Friday 22:00 UK time
+    until Sunday 22:00 UK time.
+    """
+
+    now = london_now()
     weekday = now.weekday()
     current_time = now.time()
 
-    if weekday == 4 and current_time >= datetime.strptime("22:00", "%H:%M").time():
+    sleep_start = datetime.strptime(
+        "22:00",
+        "%H:%M"
+    ).time()
+
+    sleep_end = datetime.strptime(
+        "22:00",
+        "%H:%M"
+    ).time()
+
+    # Friday after 22:00
+    if weekday == 4 and current_time >= sleep_start:
         return True
 
+    # All Saturday
     if weekday == 5:
         return True
 
-    if weekday == 6 and current_time < datetime.strptime("22:00", "%H:%M").time():
+    # Sunday before 22:00
+    if weekday == 6 and current_time < sleep_end:
         return True
 
     return False
 
 
 def is_within_scouting_time():
-    now = datetime.now(ZoneInfo(SCOUT_TIMEZONE)).time()
+    """
+    Handles normal and overnight trading windows.
+    """
 
-    for start_str, end_str in SCOUT_WINDOWS:
-        start = datetime.strptime(start_str, "%H:%M").time()
-        end = datetime.strptime(end_str, "%H:%M").time()
+    current_time = london_now().time()
 
+    for start_text, end_text in SCOUT_WINDOWS:
+        start = datetime.strptime(
+            start_text,
+            "%H:%M"
+        ).time()
+
+        end = datetime.strptime(
+            end_text,
+            "%H:%M"
+        ).time()
+
+        # Normal window
         if start < end:
-            if start <= now <= end:
+            if start <= current_time <= end:
                 return True
+
+        # Overnight window, e.g. 23:00–03:00
         else:
-            if now >= start or now <= end:
+            if current_time >= start or current_time <= end:
                 return True
 
     return False
 
 
+# ============================================================
+# TELEGRAM
+# ============================================================
+
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "Missing TELEGRAM_BOT_TOKEN"
+        )
+
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "Missing TELEGRAM_CHAT_ID"
+        )
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
-    response = requests.post(url, json=payload, timeout=20)
-    return response.json()
 
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(
+            f"Telegram error: {result}"
+        )
+
+    return result
+
+
+# ============================================================
+# TWELVE DATA
+# ============================================================
 
 def get_data(interval):
-    url = "https://api.twelvedata.com/time_series"
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError(
+            "Missing TWELVE_DATA_API_KEY"
+        )
+
+    url = (
+        "https://api.twelvedata.com/"
+        "time_series"
+    )
+
     params = {
         "symbol": SYMBOL,
         "interval": interval,
-        "outputsize": 100,
+        "outputsize": 120,
         "apikey": TWELVE_DATA_API_KEY,
     }
 
-    response = requests.get(url, params=params, timeout=20)
+    response = requests.get(
+        url,
+        params=params,
+        timeout=25,
+    )
+
+    response.raise_for_status()
     data = response.json()
 
     if "values" not in data:
-        raise Exception(f"Twelve Data error: {data}")
+        raise RuntimeError(
+            f"Twelve Data error for "
+            f"{interval}: {data}"
+        )
 
-    df = pd.DataFrame(data["values"])
-    df = df.rename(columns={"datetime": "time"})
-    df["time"] = pd.to_datetime(df["time"])
+    df = pd.DataFrame(
+        data["values"]
+    )
+
+    required_columns = {
+        "datetime",
+        "open",
+        "high",
+        "low",
+        "close",
+    }
+
+    missing = (
+        required_columns
+        - set(df.columns)
+    )
+
+    if missing:
+        raise RuntimeError(
+            f"Missing data columns: {missing}"
+        )
+
+    df = df.rename(
+        columns={"datetime": "time"}
+    )
+
+    df["time"] = pd.to_datetime(
+        df["time"]
+    )
+
     df = df.sort_values("time")
 
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df = df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+    )
 
     return df.reset_index(drop=True)
 
 
-def indicators(df):
-    df["bb_mid"] = df["close"].rolling(20).mean()
-    df["bb_std"] = df["close"].rolling(20).std()
-    df["bb_upper"] = df["bb_mid"] + (2 * df["bb_std"])
-    df["bb_lower"] = df["bb_mid"] - (2 * df["bb_std"])
+# ============================================================
+# INDICATORS
+# ============================================================
 
+def calculate_indicators(df):
+    df = df.copy()
+
+    # Bollinger Bands
+    df["bb_mid"] = (
+        df["close"]
+        .rolling(20)
+        .mean()
+    )
+
+    df["bb_std"] = (
+        df["close"]
+        .rolling(20)
+        .std()
+    )
+
+    df["bb_upper"] = (
+        df["bb_mid"]
+        + (2 * df["bb_std"])
+    )
+
+    df["bb_lower"] = (
+        df["bb_mid"]
+        - (2 * df["bb_std"])
+    )
+
+    df["bb_width"] = (
+        df["bb_upper"]
+        - df["bb_lower"]
+    )
+
+    # RSI using Wilder smoothing
     delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss
-    df["rsi"] = 100 - (100 / (1 + rs))
 
-    low14 = df["low"].rolling(14).min()
-    high14 = df["high"].rolling(14).max()
-    df["stoch_k"] = 100 * ((df["close"] - low14) / (high14 - low14))
-    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    # ATR
-    df["prev_close"] = df["close"].shift(1)
-    df["tr1"] = df["high"] - df["low"]
-    df["tr2"] = (df["high"] - df["prev_close"]).abs()
-    df["tr3"] = (df["low"] - df["prev_close"]).abs()
-    df["true_range"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
-    df["atr"] = df["true_range"].rolling(14).mean()
+    average_gain = gain.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
 
-    # ADX
-    df["up_move"] = df["high"] - df["high"].shift(1)
-    df["down_move"] = df["low"].shift(1) - df["low"]
+    average_loss = loss.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
 
-    df["+dm"] = df.apply(
-        lambda row: row["up_move"] if row["up_move"] > row["down_move"] and row["up_move"] > 0 else 0,
-        axis=1,
+    relative_strength = (
+        average_gain
+        / average_loss.replace(0, float("nan"))
     )
 
-    df["-dm"] = df.apply(
-        lambda row: row["down_move"] if row["down_move"] > row["up_move"] and row["down_move"] > 0 else 0,
-        axis=1,
+    df["rsi"] = (
+        100
+        - (
+            100
+            / (1 + relative_strength)
+        )
     )
 
-    df["+di"] = 100 * (df["+dm"].rolling(14).mean() / df["atr"])
-    df["-di"] = 100 * (df["-dm"].rolling(14).mean() / df["atr"])
-    df["dx"] = 100 * ((df["+di"] - df["-di"]).abs() / (df["+di"] + df["-di"]))
-    df["adx"] = df["dx"].rolling(14).mean()
+    # Stochastic
+    lowest_low = (
+        df["low"]
+        .rolling(14)
+        .min()
+    )
 
-    return df.dropna().reset_index(drop=True)
+    highest_high = (
+        df["high"]
+        .rolling(14)
+        .max()
+    )
 
+    stochastic_range = (
+        highest_high
+        - lowest_low
+    ).replace(0, float("nan"))
+
+    df["stoch_k"] = (
+        100
+        * (
+            (
+                df["close"]
+                - lowest_low
+            )
+            / stochastic_range
+        )
+    )
+
+    df["stoch_d"] = (
+        df["stoch_k"]
+        .rolling(3)
+        .mean()
+    )
+
+    # True Range and ATR
+    previous_close = (
+        df["close"]
+        .shift(1)
+    )
+
+    true_range = pd.concat(
+        [
+            df["high"] - df["low"],
+            (
+                df["high"]
+                - previous_close
+            ).abs(),
+            (
+                df["low"]
+                - previous_close
+            ).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    df["true_range"] = true_range
+
+    df["atr"] = true_range.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
+
+    # ADX directional movement
+    up_move = (
+        df["high"]
+        - df["high"].shift(1)
+    )
+
+    down_move = (
+        df["low"].shift(1)
+        - df["low"]
+    )
+
+    plus_dm = up_move.where(
+        (up_move > down_move)
+        & (up_move > 0),
+        0.0,
+    )
+
+    minus_dm = down_move.where(
+        (down_move > up_move)
+        & (down_move > 0),
+        0.0,
+    )
+
+    smoothed_plus_dm = plus_dm.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
+
+    smoothed_minus_dm = minus_dm.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
+
+    atr_safe = df["atr"].replace(
+        0,
+        float("nan"),
+    )
+
+    df["plus_di"] = (
+        100
+        * smoothed_plus_dm
+        / atr_safe
+    )
+
+    df["minus_di"] = (
+        100
+        * smoothed_minus_dm
+        / atr_safe
+    )
+
+    di_sum = (
+        df["plus_di"]
+        + df["minus_di"]
+    ).replace(
+        0,
+        float("nan"),
+    )
+
+    df["dx"] = (
+        100
+        * (
+            (
+                df["plus_di"]
+                - df["minus_di"]
+            ).abs()
+            / di_sum
+        )
+    )
+
+    df["adx"] = df["dx"].ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
+
+    df = df.replace(
+        [float("inf"), -float("inf")],
+        float("nan"),
+    )
+
+    return df.dropna().reset_index(
+        drop=True
+    )
+
+
+# ============================================================
+# SIGNAL CLASSIFICATION
+# ============================================================
 
 def grade_from_score(score):
     if score >= 6:
         return "A+"
+
     if score == 5:
         return "A-"
+
     if score == 4:
         return "B+"
+
     if score == 3:
         return "B"
+
     return "NO TRADE"
 
 
 def quality_from_score(score):
     if score >= 5:
         return "EXECUTION GRADE"
+
     if score == 4:
         return "WATCH CLOSELY"
+
     return "WAIT"
 
 
 def lot_size_from_score(score):
     if score >= 6:
         return 0.50
-    elif score == 5:
+
+    if score == 5:
         return 0.25
-    elif score == 4:
+
+    if score == 4:
         return 0.15
-    else:
-        return 0.00
+
+    return 0.00
 
 
 def h1_bias(candle):
-    if candle["close"] > candle["bb_mid"] and candle["rsi"] >= 55:
+    bullish = (
+        candle["close"]
+        > candle["bb_mid"]
+        and candle["rsi"] >= 55
+        and candle["plus_di"]
+        > candle["minus_di"]
+    )
+
+    bearish = (
+        candle["close"]
+        < candle["bb_mid"]
+        and candle["rsi"] <= 45
+        and candle["minus_di"]
+        > candle["plus_di"]
+    )
+
+    if bullish:
         return "BUY"
 
-    if candle["close"] < candle["bb_mid"] and candle["rsi"] <= 45:
+    if bearish:
         return "SELL"
 
     return "NEUTRAL"
 
 
 def momentum_strength(candle):
-    adx = candle["adx"]
+    adx = float(candle["adx"])
 
     if adx >= 35:
         return "Very Strong"
-    elif adx >= 25:
+
+    if adx >= 25:
         return "Strong"
-    elif adx >= 20:
-        return "Medium"
+
+    if adx >= 23:
+        return "Moderate"
+
+    return "Weak"
+
+
+# ============================================================
+# CONFIRMATION PATTERNS
+# ============================================================
+
+def candle_body(candle):
+    return abs(
+        candle["close"]
+        - candle["open"]
+    )
+
+
+def candle_range(candle):
+    return max(
+        candle["high"]
+        - candle["low"],
+        0.0001,
+    )
+
+
+def bullish_engulfing(current, previous):
+    return (
+        current["close"] > current["open"]
+        and previous["close"] < previous["open"]
+        and current["open"] <= previous["close"]
+        and current["close"] >= previous["open"]
+    )
+
+
+def bearish_engulfing(current, previous):
+    return (
+        current["close"] < current["open"]
+        and previous["close"] > previous["open"]
+        and current["open"] >= previous["close"]
+        and current["close"] <= previous["open"]
+    )
+
+
+def bullish_rejection(candle):
+    body = candle_body(candle)
+
+    lower_wick = (
+        min(
+            candle["open"],
+            candle["close"],
+        )
+        - candle["low"]
+    )
+
+    upper_wick = (
+        candle["high"]
+        - max(
+            candle["open"],
+            candle["close"],
+        )
+    )
+
+    return (
+        candle["close"] > candle["open"]
+        and lower_wick >= body * 1.5
+        and lower_wick > upper_wick
+    )
+
+
+def bearish_rejection(candle):
+    body = candle_body(candle)
+
+    upper_wick = (
+        candle["high"]
+        - max(
+            candle["open"],
+            candle["close"],
+        )
+    )
+
+    lower_wick = (
+        min(
+            candle["open"],
+            candle["close"],
+        )
+        - candle["low"]
+    )
+
+    return (
+        candle["close"] < candle["open"]
+        and upper_wick >= body * 1.5
+        and upper_wick > lower_wick
+    )
+
+
+def bullish_breakout_retest(
+    current,
+    previous,
+    older,
+):
+    breakout_level = max(
+        older["high"],
+        older["bb_mid"],
+    )
+
+    return (
+        previous["close"] > breakout_level
+        and current["low"] <= breakout_level
+        and current["close"] > breakout_level
+        and current["close"] > current["open"]
+    )
+
+
+def bearish_breakout_retest(
+    current,
+    previous,
+    older,
+):
+    breakout_level = min(
+        older["low"],
+        older["bb_mid"],
+    )
+
+    return (
+        previous["close"] < breakout_level
+        and current["high"] >= breakout_level
+        and current["close"] < breakout_level
+        and current["close"] < current["open"]
+    )
+
+
+def confirmation_type(
+    side,
+    current,
+    previous,
+    older,
+):
+    if side == "BUY":
+        if bullish_engulfing(
+            current,
+            previous,
+        ):
+            return "Bullish engulfing"
+
+        if bullish_rejection(current):
+            return "Bullish rejection"
+
+        if bullish_breakout_retest(
+            current,
+            previous,
+            older,
+        ):
+            return "Breakout and retest"
+
+    if side == "SELL":
+        if bearish_engulfing(
+            current,
+            previous,
+        ):
+            return "Bearish engulfing"
+
+        if bearish_rejection(current):
+            return "Bearish rejection"
+
+        if bearish_breakout_retest(
+            current,
+            previous,
+            older,
+        ):
+            return "Breakdown and retest"
+
+    return None
+
+
+# ============================================================
+# MOMENTUM AND EXHAUSTION
+# ============================================================
+
+def atr_is_healthy(
+    current,
+    previous,
+):
+    if previous["atr"] <= 0:
+        return False
+
+    atr_ratio = (
+        current["atr"]
+        / previous["atr"]
+    )
+
+    # Allow slight contraction,
+    # but block clearly collapsing volatility.
+    return atr_ratio >= 0.95
+
+
+def momentum_is_valid(
+    side,
+    current,
+    previous,
+):
+    adx_rising = (
+        current["adx"]
+        > previous["adx"]
+    )
+
+    adx_strong = (
+        current["adx"]
+        >= MIN_ADX
+    )
+
+    if side == "BUY":
+        direction_valid = (
+            current["plus_di"]
+            > current["minus_di"]
+        )
+
     else:
-        return "Weak"
+        direction_valid = (
+            current["minus_di"]
+            > current["plus_di"]
+        )
+
+    return (
+        adx_strong
+        and adx_rising
+        and direction_valid
+    )
 
 
-def exhaustion_risk(side, candle, prev_candle):
-    adx = candle["adx"]
-    rsi = candle["rsi"]
-    atr_now = candle["atr"]
-    atr_prev = prev_candle["atr"]
+def exhaustion_risk(
+    side,
+    current,
+    previous,
+):
+    atr = float(current["atr"])
+
+    if atr <= 0:
+        return "High"
+
+    candle_move = candle_range(
+        current
+    )
+
+    large_expansion = (
+        candle_move
+        >= atr * 1.4
+    )
+
+    atr_falling = (
+        current["atr"]
+        < previous["atr"] * 0.95
+    )
 
     if side == "BUY":
-        if rsi >= 70 and candle["close"] >= candle["bb_upper"]:
+        extreme_rsi = (
+            current["rsi"] >= 70
+        )
+
+        band_extreme = (
+            current["close"]
+            >= current["bb_upper"]
+        )
+
+        if (
+            extreme_rsi
+            and band_extreme
+            and large_expansion
+        ):
             return "High"
-        if adx >= 35 and rsi >= 65:
+
+        if (
+            current["rsi"] >= 67
+            and (
+                band_extreme
+                or atr_falling
+            )
+        ):
             return "Medium"
-        if atr_now < atr_prev and rsi >= 65:
-            return "Medium"
-        return "Low"
 
     if side == "SELL":
-        if rsi <= 30 and candle["close"] <= candle["bb_lower"]:
+        extreme_rsi = (
+            current["rsi"] <= 30
+        )
+
+        band_extreme = (
+            current["close"]
+            <= current["bb_lower"]
+        )
+
+        if (
+            extreme_rsi
+            and band_extreme
+            and large_expansion
+        ):
             return "High"
-        if adx >= 35 and rsi <= 35:
+
+        if (
+            current["rsi"] <= 33
+            and (
+                band_extreme
+                or atr_falling
+            )
+        ):
             return "Medium"
-        if atr_now < atr_prev and rsi <= 35:
-            return "Medium"
-        return "Low"
 
-    return "N/A"
+    return "Low"
 
 
-def not_chasing_extreme(side, candle):
+def not_chasing_extreme(
+    side,
+    candle,
+):
+    atr = float(candle["atr"])
+
+    if atr <= 0:
+        return False
+
     if side == "BUY":
-        return candle["close"] < candle["bb_upper"]
+        distance = (
+            candle["close"]
+            - candle["bb_mid"]
+        )
+
+        return (
+            candle["close"]
+            < candle["bb_upper"]
+            and distance <= atr * 1.2
+        )
 
     if side == "SELL":
-        return candle["close"] > candle["bb_lower"]
+        distance = (
+            candle["bb_mid"]
+            - candle["close"]
+        )
+
+        return (
+            candle["close"]
+            > candle["bb_lower"]
+            and distance <= atr * 1.2
+        )
 
     return False
 
 
+# ============================================================
+# ANALYSIS
+# ============================================================
+
 def analyse():
-    h1 = indicators(get_data("1h"))
-    m15 = indicators(get_data("15min"))
-    m5 = indicators(get_data("5min"))
+    h1 = calculate_indicators(
+        get_data("1h")
+    )
 
-    c1 = h1.iloc[-2]
-    c15 = m15.iloc[-2]
-    c5 = m5.iloc[-2]
-    p5 = m5.iloc[-3]
+    m15 = calculate_indicators(
+        get_data("15min")
+    )
 
-    price = round(float(c5["close"]), 2)
-    higher_tf_bias = h1_bias(c1)
+    m5 = calculate_indicators(
+        get_data("5min")
+    )
 
-    buy_score = 0
-    sell_score = 0
-    buy_points = []
-    sell_points = []
+    if (
+        len(h1) < 4
+        or len(m15) < 4
+        or len(m5) < 5
+    ):
+        raise RuntimeError(
+            "Insufficient indicator data"
+        )
 
-    if higher_tf_bias == "BUY":
-        buy_score += 1
-        buy_points.append("H1 bullish: buyers control higher timeframe")
-        sell_points.append("H1 bullish: selling is blocked unless reversal confirms")
+    # Closed candles only
+    h1_current = h1.iloc[-2]
+    m15_current = m15.iloc[-2]
 
-    elif higher_tf_bias == "SELL":
-        sell_score += 1
-        sell_points.append("H1 bearish: sellers control higher timeframe")
-        buy_points.append("H1 bearish: buying is blocked unless reversal confirms")
+    m5_current = m5.iloc[-2]
+    m5_previous = m5.iloc[-3]
+    m5_older = m5.iloc[-4]
 
+    higher_timeframe_bias = h1_bias(
+        h1_current
+    )
+
+    # Strict H1 filter
+    if higher_timeframe_bias == "NEUTRAL":
+        return {
+            "side": "WAIT",
+            "reason": "H1 trend is neutral",
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
+
+    side = higher_timeframe_bias
+
+    # --------------------------------------------------------
+    # Six scoring conditions
+    # --------------------------------------------------------
+
+    conditions = []
+    key_points = []
+
+    # 1. H1 trend alignment
+    h1_condition = (
+        higher_timeframe_bias
+        == side
+    )
+
+    conditions.append(h1_condition)
+
+    if side == "BUY":
+        key_points.append(
+            "H1 bullish: buyers control higher timeframe"
+        )
     else:
-        buy_points.append("H1 neutral")
-        sell_points.append("H1 neutral")
+        key_points.append(
+            "H1 bearish: sellers control higher timeframe"
+        )
 
-    if c15["close"] > c15["bb_mid"] and c15["rsi"] >= 50:
-        buy_score += 1
-        buy_points.append("M15 bullish/recovering")
-
-    if c15["close"] < c15["bb_mid"] and c15["rsi"] <= 50:
-        sell_score += 1
-        sell_points.append("M15 bearish/weakening")
-
-    if c5["close"] > c5["bb_mid"]:
-        buy_score += 1
-        buy_points.append("M5 closed above Bollinger midline")
-
-    if c5["close"] < c5["bb_mid"]:
-        sell_score += 1
-        sell_points.append("M5 closed below Bollinger midline")
-
-    if c5["rsi"] > 50:
-        buy_score += 1
-        buy_points.append(f"M5 RSI {c5['rsi']:.2f} above 50 and rising")
-
-    if c5["rsi"] < 50:
-        sell_score += 1
-        sell_points.append(f"M5 RSI {c5['rsi']:.2f} below 50 and falling")
-
-    if p5["stoch_k"] < p5["stoch_d"] and c5["stoch_k"] > c5["stoch_d"]:
-        buy_score += 1
-        buy_points.append("Stochastic bullish cross confirmed")
-
-    if p5["stoch_k"] > p5["stoch_d"] and c5["stoch_k"] < c5["stoch_d"]:
-        sell_score += 1
-        sell_points.append("Stochastic bearish cross confirmed")
-
-    if c5["close"] > c5["open"]:
-        buy_score += 1
-        buy_points.append("Bullish candle close confirmed")
-
-    if c5["close"] < c5["open"]:
-        sell_score += 1
-        sell_points.append("Bearish candle close confirmed")
-
-    if not_chasing_extreme("BUY", c5):
-        buy_score += 1
-        buy_points.append("Not chasing upper Bollinger Band")
-
-    if not_chasing_extreme("SELL", c5):
-        sell_score += 1
-        sell_points.append("Not chasing lower Bollinger Band")
-
-    # ADX momentum strength
-    m_strength = momentum_strength(c5)
-
-    if c5["adx"] >= 20:
-        if buy_score > sell_score:
-            buy_score += 1
-            buy_points.append(f"ADX {c5['adx']:.2f}: momentum strength is {m_strength}")
-        elif sell_score > buy_score:
-            sell_score += 1
-            sell_points.append(f"ADX {c5['adx']:.2f}: momentum strength is {m_strength}")
+    # 2. M15 alignment
+    if side == "BUY":
+        m15_condition = (
+            m15_current["close"]
+            > m15_current["bb_mid"]
+            and m15_current["rsi"] >= 52
+            and m15_current["plus_di"]
+            > m15_current["minus_di"]
+        )
     else:
-        buy_points.append(f"ADX {c5['adx']:.2f}: weak/choppy momentum")
-        sell_points.append(f"ADX {c5['adx']:.2f}: weak/choppy momentum")
+        m15_condition = (
+            m15_current["close"]
+            < m15_current["bb_mid"]
+            and m15_current["rsi"] <= 48
+            and m15_current["minus_di"]
+            > m15_current["plus_di"]
+        )
 
-    # H1 protection
-    if higher_tf_bias == "BUY":
-        sell_score = 0
+    conditions.append(m15_condition)
 
-    if higher_tf_bias == "SELL":
-        buy_score = 0
+    if not m15_condition:
+        return {
+            "side": "WAIT",
+            "reason": (
+                "M15 is not aligned "
+                "with H1"
+            ),
+            "h1_bias": higher_timeframe_bias,
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
 
-    if buy_score > sell_score and buy_score >= MIN_SIGNAL_SCORE:
-        side = "BUY"
-        score = min(buy_score, 6)
-        key_points = buy_points
-
-    elif sell_score > buy_score and sell_score >= MIN_SIGNAL_SCORE:
-        side = "SELL"
-        score = min(sell_score, 6)
-        key_points = sell_points
-
+    if side == "BUY":
+        key_points.append(
+            "M15 bullish and aligned with H1"
+        )
     else:
-        side = "WAIT"
-        score = max(min(buy_score, 6), min(sell_score, 6))
-        key_points = [
-            f"H1 bias: {higher_tf_bias}",
-            "M15 and M5 are not sufficiently aligned",
-            "No clean confirmation yet",
-            f"ADX {c5['adx']:.2f}: momentum strength is {m_strength}",
-            "Avoid fighting the higher timeframe trend",
-            "Wait for pullback and closed-candle confirmation",
-        ]
+        key_points.append(
+            "M15 bearish and aligned with H1"
+        )
+
+    # 3. M5 Bollinger structure
+    if side == "BUY":
+        m5_structure = (
+            m5_current["close"]
+            > m5_current["bb_mid"]
+        )
+    else:
+        m5_structure = (
+            m5_current["close"]
+            < m5_current["bb_mid"]
+        )
+
+    conditions.append(m5_structure)
+
+    if not m5_structure:
+        return {
+            "side": "WAIT",
+            "reason": (
+                "M5 structure has not "
+                "confirmed direction"
+            ),
+            "h1_bias": higher_timeframe_bias,
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
+
+    if side == "BUY":
+        key_points.append(
+            "M5 closed above Bollinger midline"
+        )
+    else:
+        key_points.append(
+            "M5 closed below Bollinger midline"
+        )
+
+    # 4. M5 RSI momentum
+    rsi_rising = (
+        m5_current["rsi"]
+        > m5_previous["rsi"]
+    )
+
+    rsi_falling = (
+        m5_current["rsi"]
+        < m5_previous["rsi"]
+    )
+
+    if side == "BUY":
+        rsi_condition = (
+            m5_current["rsi"] >= 52
+            and rsi_rising
+        )
+    else:
+        rsi_condition = (
+            m5_current["rsi"] <= 48
+            and rsi_falling
+        )
+
+    conditions.append(rsi_condition)
+
+    if side == "BUY":
+        key_points.append(
+            f"M5 RSI {m5_current['rsi']:.2f} "
+            "above 52 and rising"
+        )
+    else:
+        key_points.append(
+            f"M5 RSI {m5_current['rsi']:.2f} "
+            "below 48 and falling"
+        )
+
+    # 5. ADX, DI and ATR momentum
+    momentum_condition = (
+        momentum_is_valid(
+            side,
+            m5_current,
+            m5_previous,
+        )
+        and atr_is_healthy(
+            m5_current,
+            m5_previous,
+        )
+    )
+
+    conditions.append(
+        momentum_condition
+    )
+
+    if not momentum_condition:
+        return {
+            "side": "WAIT",
+            "reason": (
+                "ADX, directional movement "
+                "or ATR is insufficient"
+            ),
+            "h1_bias": higher_timeframe_bias,
+            "adx": round(
+                float(
+                    m5_current["adx"]
+                ),
+                2,
+            ),
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
+
+    strength = momentum_strength(
+        m5_current
+    )
+
+    key_points.append(
+        f"ADX {m5_current['adx']:.2f} "
+        f"and rising: momentum is {strength}"
+    )
+
+    if side == "BUY":
+        key_points.append(
+            "+DI is above -DI"
+        )
+    else:
+        key_points.append(
+            "-DI is above +DI"
+        )
+
+    # 6. Confirmation pattern
+    confirmation = confirmation_type(
+        side,
+        m5_current,
+        m5_previous,
+        m5_older,
+    )
+
+    chase_condition = (
+        not_chasing_extreme(
+            side,
+            m5_current,
+        )
+    )
+
+    confirmation_condition = (
+        confirmation is not None
+        and chase_condition
+    )
+
+    conditions.append(
+        confirmation_condition
+    )
+
+    if not confirmation_condition:
+        return {
+            "side": "WAIT",
+            "reason": (
+                "No valid engulfing, "
+                "rejection or retest confirmation"
+            ),
+            "h1_bias": higher_timeframe_bias,
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
+
+    key_points.append(
+        f"{confirmation} confirmed"
+    )
+
+    if side == "BUY":
+        key_points.append(
+            "Not chasing upper Bollinger Band"
+        )
+    else:
+        key_points.append(
+            "Not chasing lower Bollinger Band"
+        )
+
+    # Exhaustion filter
+    exhaustion = exhaustion_risk(
+        side,
+        m5_current,
+        m5_previous,
+    )
+
+    if exhaustion == "High":
+        return {
+            "side": "WAIT",
+            "reason": (
+                "Momentum is highly exhausted"
+            ),
+            "h1_bias": higher_timeframe_bias,
+            "exhaustion_risk": exhaustion,
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
+
+    score = sum(
+        1
+        for condition in conditions
+        if condition
+    )
+
+    if score < MIN_SIGNAL_SCORE:
+        return {
+            "side": "WAIT",
+            "reason": (
+                f"Score {score}/6 is below "
+                f"minimum {MIN_SIGNAL_SCORE}/6"
+            ),
+            "h1_bias": higher_timeframe_bias,
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
 
     grade = grade_from_score(score)
     quality = quality_from_score(score)
-    exhaustion = exhaustion_risk(side, c5, p5)
+
+    if quality != "EXECUTION GRADE":
+        return {
+            "side": "WAIT",
+            "reason": (
+                "Signal is not Execution Grade"
+            ),
+            "score": score,
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
+
+    price = round(
+        float(m5_current["close"]),
+        2,
+    )
+
+    atr = float(
+        m5_current["atr"]
+    )
+
+    # Entry zone based on ATR instead of fixed $2
+    entry_buffer = max(
+        round(atr * 0.20, 2),
+        0.50,
+    )
+
+    # Stop buffer
+    stop_buffer = max(
+        round(atr * 0.25, 2),
+        0.75,
+    )
 
     if side == "BUY":
         emoji = "🟢"
+
         entry_low = price
-        entry_high = round(price + 2, 2)
-        sl = round(min(float(c5["low"]), float(c5["bb_mid"])) - 2, 2)
-        stop_distance = entry_low - sl
 
-        tp1 = round(entry_low + stop_distance, 2)
-        tp2 = round(entry_low + (stop_distance * 1.8), 2)
+        entry_high = round(
+            price + entry_buffer,
+            2,
+        )
 
-        entry_text = f"{entry_low} - {entry_high} after breakout/bullish close"
-        invalidation = f"Bias fails if M5 closes below {sl}, RSI drops below 50, ADX weakens below 20, or H1 loses bullish structure."
-        why = "H1 supports buying, M15 is not fighting the trade, M5 confirms bullish momentum, and ADX shows whether the move has strength."
+        structural_stop = min(
+            float(m5_current["low"]),
+            float(m5_current["bb_mid"]),
+        )
 
-    elif side == "SELL":
-        emoji = "🔴"
-        entry_low = price
-        entry_high = round(price + 2, 2)
-        sl = round(max(float(c5["high"]), float(c5["bb_mid"])) + 2, 2)
-        stop_distance = sl - entry_low
+        stop_loss = round(
+            structural_stop
+            - stop_buffer,
+            2,
+        )
 
-        tp1 = round(entry_low - stop_distance, 2)
-        tp2 = round(entry_low - (stop_distance * 1.8), 2)
+        risk = (
+            entry_low
+            - stop_loss
+        )
 
-        entry_text = f"{entry_low} - {entry_high} after rejection/bearish close"
-        invalidation = f"Bias fails if M5 closes above {sl}, RSI reclaims 50, ADX weakens below 20, or H1 turns bullish."
-        why = "H1 supports selling, M15 is not fighting the trade, M5 confirms bearish momentum, and ADX shows whether the move has strength."
+        if risk <= 0:
+            return {
+                "side": "WAIT",
+                "reason": (
+                    "Invalid BUY risk calculation"
+                ),
+                "candle_time": str(
+                    m5_current["time"]
+                ),
+            }
+
+        take_profit_1 = round(
+            entry_low + risk,
+            2,
+        )
+
+        take_profit_2 = round(
+            entry_low + risk * 1.8,
+            2,
+        )
+
+        entry_text = (
+            f"{entry_low:.2f} - "
+            f"{entry_high:.2f} "
+            f"after {confirmation.lower()}"
+        )
+
+        why = (
+            "H1 is bullish, M15 agrees, "
+            "and M5 has produced a confirmed "
+            "bullish trigger. ADX is rising, "
+            "+DI controls direction, and ATR "
+            "shows sufficient movement."
+        )
+
+        invalidation = (
+            f"Bias fails if M5 closes below "
+            f"{stop_loss:.2f}, RSI loses 50, "
+            f"ADX falls below {MIN_ADX:.0f}, "
+            "or H1 loses bullish structure."
+        )
 
     else:
-        emoji = "🟡"
-        entry_text = "No trade"
-        tp1 = "N/A"
-        tp2 = "N/A"
-        sl = "N/A"
-        invalidation = "A confirmed H1, M15, and M5 alignment with closed-candle confirmation and stronger ADX momentum."
-        why = "The bot is protecting the account by avoiding counter-trend entries, weak momentum, exhaustion zones, and emotional trades."
+        emoji = "🔴"
 
-    lot = lot_size_from_score(score)
-    lot_text = "No Trade" if side == "WAIT" or lot == 0 else f"{lot:.2f} lot"
+        entry_high = price
 
-    message = f"""{emoji} XAUUSD SIGNAL
+        entry_low = round(
+            price - entry_buffer,
+            2,
+        )
 
-Best Scenario
-{side} ({grade} | Score {score}/6)
+        structural_stop = max(
+            float(m5_current["high"]),
+            float(m5_current["bb_mid"]),
+        )
 
-Quality
-{quality}
+        stop_loss = round(
+            structural_stop
+            + stop_buffer,
+            2,
+        )
 
-Momentum Strength
-{m_strength}
+        risk = (
+            stop_loss
+            - entry_high
+        )
 
-Exhaustion Risk
-{exhaustion}
+        if risk <= 0:
+            return {
+                "side": "WAIT",
+                "reason": (
+                    "Invalid SELL risk calculation"
+                ),
+                "candle_time": str(
+                    m5_current["time"]
+                ),
+            }
 
-Entry
-{entry_text}
+        take_profit_1 = round(
+            entry_high - risk,
+            2,
+        )
 
-Take Profit
-TP1 {tp1} | TP2 {tp2}
+        take_profit_2 = round(
+            entry_high - risk * 1.8,
+            2,
+        )
 
-Stop Loss
-{sl}
+        entry_text = (
+            f"{entry_low:.2f} - "
+            f"{entry_high:.2f} "
+            f"after {confirmation.lower()}"
+        )
 
-Best Lot Size
-{lot_text}
+        why = (
+            "H1 is bearish, M15 agrees, "
+            "and M5 has produced a confirmed "
+            "bearish trigger. ADX is rising, "
+            "-DI controls direction, and ATR "
+            "shows sufficient movement."
+        )
 
-Key Points
-""" + "\n".join([f"• {point}" for point in key_points]) + f"""
+        invalidation = (
+            f"Bias fails if M5 closes above "
+            f"{stop_loss:.2f}, RSI reclaims 50, "
+            f"ADX falls below {MIN_ADX:.0f}, "
+            "or H1 turns bullish."
+        )
 
-Why this bias
-{why}
+    lot = lot_size_from_score(
+        score
+    )
 
-What can invalidate this bias
-{invalidation}
-"""
+    lot_text = (
+        f"{lot:.2f} lot"
+    )
+
+    message = (
+        f"{emoji} XAUUSD SIGNAL\n\n"
+        f"Best Scenario\n"
+        f"{side} "
+        f"({grade} | Score {score}/6)\n\n"
+        f"Quality\n"
+        f"{quality}\n\n"
+        f"Momentum Strength\n"
+        f"{strength}\n\n"
+        f"Exhaustion Risk\n"
+        f"{exhaustion}\n\n"
+        f"Entry\n"
+        f"{entry_text}\n\n"
+        f"Take Profit\n"
+        f"TP1 {take_profit_1:.2f} | "
+        f"TP2 {take_profit_2:.2f}\n\n"
+        f"Stop Loss\n"
+        f"{stop_loss:.2f}\n\n"
+        f"Best Lot Size\n"
+        f"{lot_text}\n\n"
+        f"Key Points\n"
+        + "\n".join(
+            f"• {point}"
+            for point in key_points
+        )
+        + "\n\n"
+        f"Why this bias\n"
+        f"{why}\n\n"
+        f"What can invalidate this bias\n"
+        f"{invalidation}"
+    )
 
     return {
         "side": side,
         "score": score,
+        "grade": grade,
         "quality": quality,
-        "h1_bias": higher_tf_bias,
-        "momentum_strength": m_strength,
+        "h1_bias": higher_timeframe_bias,
+        "momentum_strength": strength,
         "exhaustion_risk": exhaustion,
+        "entry": entry_text,
+        "stop_loss": stop_loss,
+        "tp1": take_profit_1,
+        "tp2": take_profit_2,
+        "lot_size": lot,
         "message": message,
-        "candle_time": str(c5["time"]),
+        "candle_time": str(
+            m5_current["time"]
+        ),
     }
 
+
+# ============================================================
+# SIGNAL DELIVERY CONTROL
+# ============================================================
 
 def should_send(signal):
     if not signal:
         return False
 
-    if signal["candle_time"] == state["last_candle_time"]:
+    # Never send WAIT messages
+    if signal.get("side") == "WAIT":
+        return False
+
+    # Only Execution Grade
+    if (
+        signal.get("quality")
+        != "EXECUTION GRADE"
+    ):
+        return False
+
+    candle_time = signal.get(
+        "candle_time"
+    )
+
+    if (
+        candle_time
+        == state["last_candle_time"]
+    ):
         return False
 
     now = datetime.now(timezone.utc)
 
     if state["last_signal_time"]:
-        minutes_since_last = (now - state["last_signal_time"]).total_seconds() / 60
-        if minutes_since_last < SIGNAL_COOLDOWN_MINUTES:
+        elapsed_minutes = (
+            now
+            - state["last_signal_time"]
+        ).total_seconds() / 60
+
+        if (
+            elapsed_minutes
+            < SIGNAL_COOLDOWN_MINUTES
+        ):
             return False
 
     return True
@@ -479,32 +1519,75 @@ def run_once():
     if is_weekend_sleep():
         return {
             "status": "SLEEPING",
-            "reason": "Weekend shutdown active",
-            "sleep_window": "Friday 22:00 to Sunday 22:00",
+            "reason": (
+                "Weekend shutdown active"
+            ),
+            "sleep_window": (
+                "Friday 22:00 "
+                "to Sunday 22:00"
+            ),
             "timezone": SCOUT_TIMEZONE,
         }
 
     if not is_within_scouting_time():
         return {
             "status": "OFF_SESSION",
-            "reason": "Outside high-probability trading windows",
-            "scouting_windows": SCOUT_WINDOWS,
+            "reason": (
+                "Outside approved "
+                "scouting windows"
+            ),
+            "scouting_windows": (
+                SCOUT_WINDOWS
+            ),
             "timezone": SCOUT_TIMEZONE,
         }
 
     signal = analyse()
 
     if should_send(signal):
-        send_telegram(signal["message"])
-        state["last_signal_time"] = datetime.now(timezone.utc)
-        state["last_candle_time"] = signal["candle_time"]
+        send_telegram(
+            signal["message"]
+        )
+
+        state["last_signal_time"] = (
+            datetime.now(timezone.utc)
+        )
+
+        state["last_candle_time"] = (
+            signal["candle_time"]
+        )
+
+        state["last_signal_side"] = (
+            signal["side"]
+        )
+
+        print(
+            f"Signal sent: "
+            f"{signal['side']} "
+            f"{signal['grade']} "
+            f"{signal['score']}/6",
+            flush=True,
+        )
+
         return signal
 
     return {
         "status": "WAIT",
-        "reason": "No valid signal, duplicate candle, or cooldown active",
+        "reason": signal.get(
+            "reason",
+            (
+                "No Execution Grade signal, "
+                "duplicate candle, or "
+                "cooldown active"
+            ),
+        ),
+        "analysis": signal,
     }
 
+
+# ============================================================
+# BACKGROUND BOT LOOP
+# ============================================================
 
 def bot_loop():
     time.sleep(10)
@@ -512,30 +1595,72 @@ def bot_loop():
     while True:
         try:
             result = run_once()
-            print(result, flush=True)
+
+            print(
+                result,
+                flush=True,
+            )
+
         except Exception as error:
-            print(f"Bot error: {error}", flush=True)
+            print(
+                f"Bot error: {error}",
+                flush=True,
+            )
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(
+            POLL_INTERVAL_SECONDS
+        )
 
+
+# ============================================================
+# FLASK ROUTES
+# ============================================================
 
 @app.route("/")
 def home():
+    now = london_now()
+
     return jsonify({
         "status": "running",
         "symbol": SYMBOL,
-        "strategy": "H1 trend filter + M15 alignment + M5 confirmation + ADX/ATR momentum filter",
-        "scout_timezone": SCOUT_TIMEZONE,
-        "scout_windows": SCOUT_WINDOWS,
-        "currently_scouting": is_within_scouting_time(),
-        "weekend_sleep": "Friday 22:00 to Sunday 22:00",
-        "sleeping_now": is_weekend_sleep(),
-        "cooldown_minutes": SIGNAL_COOLDOWN_MINUTES,
-        "min_signal_score": MIN_SIGNAL_SCORE,
+        "uk_time": now.isoformat(),
+        "strategy": (
+            "Strict H1 + M15 alignment, "
+            "M5 confirmation, ADX/DI, "
+            "ATR and exhaustion filters"
+        ),
+        "scout_timezone": (
+            SCOUT_TIMEZONE
+        ),
+        "scout_windows": (
+            SCOUT_WINDOWS
+        ),
+        "currently_scouting": (
+            is_within_scouting_time()
+        ),
+        "weekend_sleep": (
+            "Friday 22:00 "
+            "to Sunday 22:00"
+        ),
+        "sleeping_now": (
+            is_weekend_sleep()
+        ),
+        "cooldown_minutes": (
+            SIGNAL_COOLDOWN_MINUTES
+        ),
+        "minimum_score": (
+            MIN_SIGNAL_SCORE
+        ),
+        "minimum_adx": (
+            MIN_ADX
+        ),
+        "telegram_policy": (
+            "Execution Grade only"
+        ),
         "lot_sizes": {
             "A+": "0.50 lot",
             "A-": "0.25 lot",
-            "B+": "0.15 lot",
+            "B+": "0.15 lot - not sent",
             "B/WAIT": "No Trade",
         },
     })
@@ -543,13 +1668,34 @@ def home():
 
 @app.route("/run-once")
 def manual_run():
-    return jsonify(run_once())
+    return jsonify(
+        run_once()
+    )
 
 
 @app.route("/test-telegram")
 def test_telegram():
-    result = send_telegram("✅ XAUUSD bot test message received.")
+    result = send_telegram(
+        "✅ XAUUSD bot test message received."
+    )
+
     return jsonify(result)
 
 
-threading.Thread(target=bot_loop, daemon=True).start()
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        ),
+    })
+
+
+# Start one background loop.
+threading.Thread(
+    target=bot_loop,
+    daemon=True,
+).start()
