@@ -21,27 +21,27 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
 
 POLL_INTERVAL_SECONDS = int(
-    os.getenv("POLL_INTERVAL_SECONDS", 300)
+    os.getenv("POLL_INTERVAL_SECONDS", "300")
 )
 
 SIGNAL_COOLDOWN_MINUTES = int(
-    os.getenv("SIGNAL_COOLDOWN_MINUTES", 45)
+    os.getenv("SIGNAL_COOLDOWN_MINUTES", "30")
 )
 
 MIN_SIGNAL_SCORE = int(
-    os.getenv("MIN_SIGNAL_SCORE", 5)
+    os.getenv("MIN_SIGNAL_SCORE", "5")
 )
 
 MIN_ADX = float(
-    os.getenv("MIN_ADX", 23)
+    os.getenv("MIN_ADX", "20")
 )
 
 SCOUT_TIMEZONE = os.getenv(
     "SCOUT_TIMEZONE",
-    "Europe/London"
+    "Europe/London",
 )
 
-# UK scouting windows
+# Approved UK trading windows
 SCOUT_WINDOWS = [
     ("23:00", "03:00"),
     ("07:00", "10:00"),
@@ -56,7 +56,7 @@ state = {
 
 
 # ============================================================
-# SESSION CONTROL
+# TIME AND SESSION CONTROL
 # ============================================================
 
 def london_now():
@@ -67,27 +67,21 @@ def london_now():
 
 def is_weekend_sleep():
     """
-    Bot sleeps:
-    Friday 22:00 UK time
-    until Sunday 22:00 UK time.
+    Weekend shutdown:
+    Friday 22:00 UK time until Sunday 22:00 UK time.
     """
 
     now = london_now()
     weekday = now.weekday()
     current_time = now.time()
 
-    sleep_start = datetime.strptime(
+    boundary = datetime.strptime(
         "22:00",
-        "%H:%M"
+        "%H:%M",
     ).time()
 
-    sleep_end = datetime.strptime(
-        "22:00",
-        "%H:%M"
-    ).time()
-
-    # Friday after 22:00
-    if weekday == 4 and current_time >= sleep_start:
+    # Friday from 22:00 onward
+    if weekday == 4 and current_time >= boundary:
         return True
 
     # All Saturday
@@ -95,7 +89,7 @@ def is_weekend_sleep():
         return True
 
     # Sunday before 22:00
-    if weekday == 6 and current_time < sleep_end:
+    if weekday == 6 and current_time < boundary:
         return True
 
     return False
@@ -103,7 +97,7 @@ def is_weekend_sleep():
 
 def is_within_scouting_time():
     """
-    Handles normal and overnight trading windows.
+    Supports normal and overnight windows.
     """
 
     current_time = london_now().time()
@@ -111,15 +105,15 @@ def is_within_scouting_time():
     for start_text, end_text in SCOUT_WINDOWS:
         start = datetime.strptime(
             start_text,
-            "%H:%M"
+            "%H:%M",
         ).time()
 
         end = datetime.strptime(
             end_text,
-            "%H:%M"
+            "%H:%M",
         ).time()
 
-        # Normal window
+        # Normal window, e.g. 07:00–10:00
         if start < end:
             if start <= current_time <= end:
                 return True
@@ -165,7 +159,6 @@ def send_telegram(message):
     )
 
     response.raise_for_status()
-
     result = response.json()
 
     if not result.get("ok"):
@@ -209,8 +202,7 @@ def get_data(interval):
 
     if "values" not in data:
         raise RuntimeError(
-            f"Twelve Data error for "
-            f"{interval}: {data}"
+            f"Twelve Data error for {interval}: {data}"
         )
 
     df = pd.DataFrame(
@@ -225,14 +217,14 @@ def get_data(interval):
         "close",
     }
 
-    missing = (
+    missing_columns = (
         required_columns
         - set(df.columns)
     )
 
-    if missing:
+    if missing_columns:
         raise RuntimeError(
-            f"Missing data columns: {missing}"
+            f"Missing columns: {missing_columns}"
         )
 
     df = df.rename(
@@ -303,7 +295,7 @@ def calculate_indicators(df):
         - df["bb_lower"]
     )
 
-    # RSI using Wilder smoothing
+    # RSI using Wilder-style smoothing
     delta = df["close"].diff()
 
     gain = delta.clip(lower=0)
@@ -323,7 +315,10 @@ def calculate_indicators(df):
 
     relative_strength = (
         average_gain
-        / average_loss.replace(0, float("nan"))
+        / average_loss.replace(
+            0,
+            float("nan"),
+        )
     )
 
     df["rsi"] = (
@@ -350,7 +345,10 @@ def calculate_indicators(df):
     stochastic_range = (
         highest_high
         - lowest_low
-    ).replace(0, float("nan"))
+    ).replace(
+        0,
+        float("nan"),
+    )
 
     df["stoch_k"] = (
         100
@@ -369,7 +367,7 @@ def calculate_indicators(df):
         .mean()
     )
 
-    # True Range and ATR
+    # ATR
     previous_close = (
         df["close"]
         .shift(1)
@@ -398,7 +396,7 @@ def calculate_indicators(df):
         min_periods=14,
     ).mean()
 
-    # ADX directional movement
+    # ADX and directional indicators
     up_move = (
         df["high"]
         - df["high"].shift(1)
@@ -486,7 +484,7 @@ def calculate_indicators(df):
 
 
 # ============================================================
-# SIGNAL CLASSIFICATION
+# GRADING AND LOT SIZE
 # ============================================================
 
 def grade_from_score(score):
@@ -528,21 +526,21 @@ def lot_size_from_score(score):
     return 0.00
 
 
+# ============================================================
+# TREND AND MOMENTUM
+# ============================================================
+
 def h1_bias(candle):
     bullish = (
-        candle["close"]
-        > candle["bb_mid"]
-        and candle["rsi"] >= 55
-        and candle["plus_di"]
-        > candle["minus_di"]
+        candle["close"] > candle["bb_mid"]
+        and candle["rsi"] >= 53
+        and candle["plus_di"] > candle["minus_di"]
     )
 
     bearish = (
-        candle["close"]
-        < candle["bb_mid"]
-        and candle["rsi"] <= 45
-        and candle["minus_di"]
-        > candle["plus_di"]
+        candle["close"] < candle["bb_mid"]
+        and candle["rsi"] <= 47
+        and candle["minus_di"] > candle["plus_di"]
     )
 
     if bullish:
@@ -563,14 +561,60 @@ def momentum_strength(candle):
     if adx >= 25:
         return "Strong"
 
-    if adx >= 23:
+    if adx >= 20:
         return "Moderate"
 
     return "Weak"
 
 
+def atr_is_healthy(current, previous):
+    if previous["atr"] <= 0:
+        return False
+
+    atr_ratio = (
+        current["atr"]
+        / previous["atr"]
+    )
+
+    # Relaxed from 0.95 to 0.90
+    return atr_ratio >= 0.90
+
+
+def momentum_is_valid(
+    side,
+    current,
+    previous,
+):
+    # ADX may be stable or only slightly lower
+    adx_stable_or_rising = (
+        current["adx"]
+        >= previous["adx"] * 0.98
+    )
+
+    adx_strong_enough = (
+        current["adx"] >= MIN_ADX
+    )
+
+    if side == "BUY":
+        direction_valid = (
+            current["plus_di"]
+            > current["minus_di"]
+        )
+    else:
+        direction_valid = (
+            current["minus_di"]
+            > current["plus_di"]
+        )
+
+    return (
+        adx_strong_enough
+        and adx_stable_or_rising
+        and direction_valid
+    )
+
+
 # ============================================================
-# CONFIRMATION PATTERNS
+# CANDLE PATTERNS
 # ============================================================
 
 def candle_body(candle):
@@ -607,7 +651,10 @@ def bearish_engulfing(current, previous):
 
 
 def bullish_rejection(candle):
-    body = candle_body(candle)
+    body = max(
+        candle_body(candle),
+        0.0001,
+    )
 
     lower_wick = (
         min(
@@ -627,13 +674,16 @@ def bullish_rejection(candle):
 
     return (
         candle["close"] > candle["open"]
-        and lower_wick >= body * 1.5
+        and lower_wick >= body * 1.3
         and lower_wick > upper_wick
     )
 
 
 def bearish_rejection(candle):
-    body = candle_body(candle)
+    body = max(
+        candle_body(candle),
+        0.0001,
+    )
 
     upper_wick = (
         candle["high"]
@@ -653,7 +703,7 @@ def bearish_rejection(candle):
 
     return (
         candle["close"] < candle["open"]
-        and upper_wick >= body * 1.5
+        and upper_wick >= body * 1.3
         and upper_wick > lower_wick
     )
 
@@ -694,6 +744,35 @@ def bearish_breakout_retest(
     )
 
 
+def strong_directional_candle(
+    side,
+    candle,
+):
+    body = candle_body(candle)
+    total_range = candle_range(candle)
+
+    body_ratio = (
+        body
+        / total_range
+    )
+
+    if side == "BUY":
+        return (
+            candle["close"] > candle["open"]
+            and body_ratio >= 0.60
+            and candle["close"] > candle["bb_mid"]
+        )
+
+    if side == "SELL":
+        return (
+            candle["close"] < candle["open"]
+            and body_ratio >= 0.60
+            and candle["close"] < candle["bb_mid"]
+        )
+
+    return False
+
+
 def confirmation_type(
     side,
     current,
@@ -717,6 +796,12 @@ def confirmation_type(
         ):
             return "Breakout and retest"
 
+        if strong_directional_candle(
+            "BUY",
+            current,
+        ):
+            return "Strong bullish candle close"
+
     if side == "SELL":
         if bearish_engulfing(
             current,
@@ -734,63 +819,18 @@ def confirmation_type(
         ):
             return "Breakdown and retest"
 
+        if strong_directional_candle(
+            "SELL",
+            current,
+        ):
+            return "Strong bearish candle close"
+
     return None
 
 
 # ============================================================
-# MOMENTUM AND EXHAUSTION
+# EXHAUSTION AND CHASING FILTERS
 # ============================================================
-
-def atr_is_healthy(
-    current,
-    previous,
-):
-    if previous["atr"] <= 0:
-        return False
-
-    atr_ratio = (
-        current["atr"]
-        / previous["atr"]
-    )
-
-    # Allow slight contraction,
-    # but block clearly collapsing volatility.
-    return atr_ratio >= 0.95
-
-
-def momentum_is_valid(
-    side,
-    current,
-    previous,
-):
-    adx_rising = (
-        current["adx"]
-        > previous["adx"]
-    )
-
-    adx_strong = (
-        current["adx"]
-        >= MIN_ADX
-    )
-
-    if side == "BUY":
-        direction_valid = (
-            current["plus_di"]
-            > current["minus_di"]
-        )
-
-    else:
-        direction_valid = (
-            current["minus_di"]
-            > current["plus_di"]
-        )
-
-    return (
-        adx_strong
-        and adx_rising
-        and direction_valid
-    )
-
 
 def exhaustion_risk(
     side,
@@ -802,67 +842,48 @@ def exhaustion_risk(
     if atr <= 0:
         return "High"
 
-    candle_move = candle_range(
+    current_range = candle_range(
         current
     )
 
     large_expansion = (
-        candle_move
-        >= atr * 1.4
+        current_range >= atr * 1.5
     )
 
     atr_falling = (
         current["atr"]
-        < previous["atr"] * 0.95
+        < previous["atr"] * 0.90
     )
 
     if side == "BUY":
-        extreme_rsi = (
-            current["rsi"] >= 70
-        )
-
-        band_extreme = (
-            current["close"]
-            >= current["bb_upper"]
-        )
-
         if (
-            extreme_rsi
-            and band_extreme
+            current["rsi"] >= 72
+            and current["close"] >= current["bb_upper"]
             and large_expansion
         ):
             return "High"
 
         if (
-            current["rsi"] >= 67
+            current["rsi"] >= 68
             and (
-                band_extreme
+                current["close"] >= current["bb_upper"]
                 or atr_falling
             )
         ):
             return "Medium"
 
     if side == "SELL":
-        extreme_rsi = (
-            current["rsi"] <= 30
-        )
-
-        band_extreme = (
-            current["close"]
-            <= current["bb_lower"]
-        )
-
         if (
-            extreme_rsi
-            and band_extreme
+            current["rsi"] <= 28
+            and current["close"] <= current["bb_lower"]
             and large_expansion
         ):
             return "High"
 
         if (
-            current["rsi"] <= 33
+            current["rsi"] <= 32
             and (
-                band_extreme
+                current["close"] <= current["bb_lower"]
                 or atr_falling
             )
         ):
@@ -881,27 +902,25 @@ def not_chasing_extreme(
         return False
 
     if side == "BUY":
-        distance = (
+        distance_from_midline = (
             candle["close"]
             - candle["bb_mid"]
         )
 
         return (
-            candle["close"]
-            < candle["bb_upper"]
-            and distance <= atr * 1.2
+            distance_from_midline
+            <= atr * 1.4
         )
 
     if side == "SELL":
-        distance = (
+        distance_from_midline = (
             candle["bb_mid"]
             - candle["close"]
         )
 
         return (
-            candle["close"]
-            > candle["bb_lower"]
-            and distance <= atr * 1.2
+            distance_from_midline
+            <= atr * 1.4
         )
 
     return False
@@ -933,7 +952,7 @@ def analyse():
             "Insufficient indicator data"
         )
 
-    # Closed candles only
+    # Use closed candles only
     h1_current = h1.iloc[-2]
     m15_current = m15.iloc[-2]
 
@@ -945,11 +964,14 @@ def analyse():
         h1_current
     )
 
-    # Strict H1 filter
     if higher_timeframe_bias == "NEUTRAL":
         return {
             "side": "WAIT",
             "reason": "H1 trend is neutral",
+            "h1_rsi": round(
+                float(h1_current["rsi"]),
+                2,
+            ),
             "candle_time": str(
                 m5_current["time"]
             ),
@@ -957,20 +979,11 @@ def analyse():
 
     side = higher_timeframe_bias
 
-    # --------------------------------------------------------
-    # Six scoring conditions
-    # --------------------------------------------------------
-
     conditions = []
     key_points = []
 
-    # 1. H1 trend alignment
-    h1_condition = (
-        higher_timeframe_bias
-        == side
-    )
-
-    conditions.append(h1_condition)
+    # 1. H1 direction
+    conditions.append(True)
 
     if side == "BUY":
         key_points.append(
@@ -986,7 +999,7 @@ def analyse():
         m15_condition = (
             m15_current["close"]
             > m15_current["bb_mid"]
-            and m15_current["rsi"] >= 52
+            and m15_current["rsi"] >= 50
             and m15_current["plus_di"]
             > m15_current["minus_di"]
         )
@@ -994,20 +1007,19 @@ def analyse():
         m15_condition = (
             m15_current["close"]
             < m15_current["bb_mid"]
-            and m15_current["rsi"] <= 48
+            and m15_current["rsi"] <= 50
             and m15_current["minus_di"]
             > m15_current["plus_di"]
         )
 
-    conditions.append(m15_condition)
+    conditions.append(
+        m15_condition
+    )
 
     if not m15_condition:
         return {
             "side": "WAIT",
-            "reason": (
-                "M15 is not aligned "
-                "with H1"
-            ),
+            "reason": "M15 is not aligned with H1",
             "h1_bias": higher_timeframe_bias,
             "candle_time": str(
                 m5_current["time"]
@@ -1023,7 +1035,7 @@ def analyse():
             "M15 bearish and aligned with H1"
         )
 
-    # 3. M5 Bollinger structure
+    # 3. M5 structure
     if side == "BUY":
         m5_structure = (
             m5_current["close"]
@@ -1035,15 +1047,14 @@ def analyse():
             < m5_current["bb_mid"]
         )
 
-    conditions.append(m5_structure)
+    conditions.append(
+        m5_structure
+    )
 
     if not m5_structure:
         return {
             "side": "WAIT",
-            "reason": (
-                "M5 structure has not "
-                "confirmed direction"
-            ),
+            "reason": "M5 structure has not confirmed",
             "h1_bias": higher_timeframe_bias,
             "candle_time": str(
                 m5_current["time"]
@@ -1059,7 +1070,7 @@ def analyse():
             "M5 closed below Bollinger midline"
         )
 
-    # 4. M5 RSI momentum
+    # 4. RSI confirmation
     rsi_rising = (
         m5_current["rsi"]
         > m5_previous["rsi"]
@@ -1072,29 +1083,45 @@ def analyse():
 
     if side == "BUY":
         rsi_condition = (
-            m5_current["rsi"] >= 52
+            m5_current["rsi"] >= 50
             and rsi_rising
         )
     else:
         rsi_condition = (
-            m5_current["rsi"] <= 48
+            m5_current["rsi"] <= 50
             and rsi_falling
         )
 
-    conditions.append(rsi_condition)
+    conditions.append(
+        rsi_condition
+    )
+
+    if not rsi_condition:
+        return {
+            "side": "WAIT",
+            "reason": "M5 RSI has not confirmed momentum",
+            "h1_bias": higher_timeframe_bias,
+            "m5_rsi": round(
+                float(m5_current["rsi"]),
+                2,
+            ),
+            "candle_time": str(
+                m5_current["time"]
+            ),
+        }
 
     if side == "BUY":
         key_points.append(
             f"M5 RSI {m5_current['rsi']:.2f} "
-            "above 52 and rising"
+            "above 50 and rising"
         )
     else:
         key_points.append(
             f"M5 RSI {m5_current['rsi']:.2f} "
-            "below 48 and falling"
+            "below 50 and falling"
         )
 
-    # 5. ADX, DI and ATR momentum
+    # 5. ADX, DI and ATR
     momentum_condition = (
         momentum_is_valid(
             side,
@@ -1115,14 +1142,16 @@ def analyse():
         return {
             "side": "WAIT",
             "reason": (
-                "ADX, directional movement "
-                "or ATR is insufficient"
+                "ADX, DI direction or ATR "
+                "has not confirmed momentum"
             ),
             "h1_bias": higher_timeframe_bias,
             "adx": round(
-                float(
-                    m5_current["adx"]
-                ),
+                float(m5_current["adx"]),
+                2,
+            ),
+            "previous_adx": round(
+                float(m5_previous["adx"]),
                 2,
             ),
             "candle_time": str(
@@ -1135,8 +1164,8 @@ def analyse():
     )
 
     key_points.append(
-        f"ADX {m5_current['adx']:.2f} "
-        f"and rising: momentum is {strength}"
+        f"ADX {m5_current['adx']:.2f}: "
+        f"momentum is {strength}"
     )
 
     if side == "BUY":
@@ -1148,7 +1177,7 @@ def analyse():
             "-DI is above +DI"
         )
 
-    # 6. Confirmation pattern
+    # 6. Candle confirmation
     confirmation = confirmation_type(
         side,
         m5_current,
@@ -1156,11 +1185,9 @@ def analyse():
         m5_older,
     )
 
-    chase_condition = (
-        not_chasing_extreme(
-            side,
-            m5_current,
-        )
+    chase_condition = not_chasing_extreme(
+        side,
+        m5_current,
     )
 
     confirmation_condition = (
@@ -1176,8 +1203,8 @@ def analyse():
         return {
             "side": "WAIT",
             "reason": (
-                "No valid engulfing, "
-                "rejection or retest confirmation"
+                "No valid confirmation candle "
+                "or price has moved too far"
             ),
             "h1_bias": higher_timeframe_bias,
             "candle_time": str(
@@ -1191,14 +1218,13 @@ def analyse():
 
     if side == "BUY":
         key_points.append(
-            "Not chasing upper Bollinger Band"
+            "Not chasing an extended bullish move"
         )
     else:
         key_points.append(
-            "Not chasing lower Bollinger Band"
+            "Not chasing an extended bearish move"
         )
 
-    # Exhaustion filter
     exhaustion = exhaustion_risk(
         side,
         m5_current,
@@ -1208,9 +1234,7 @@ def analyse():
     if exhaustion == "High":
         return {
             "side": "WAIT",
-            "reason": (
-                "Momentum is highly exhausted"
-            ),
+            "reason": "Momentum exhaustion risk is high",
             "h1_bias": higher_timeframe_bias,
             "exhaustion_risk": exhaustion,
             "candle_time": str(
@@ -1237,15 +1261,18 @@ def analyse():
             ),
         }
 
-    grade = grade_from_score(score)
-    quality = quality_from_score(score)
+    grade = grade_from_score(
+        score
+    )
+
+    quality = quality_from_score(
+        score
+    )
 
     if quality != "EXECUTION GRADE":
         return {
             "side": "WAIT",
-            "reason": (
-                "Signal is not Execution Grade"
-            ),
+            "reason": "Signal is not Execution Grade",
             "score": score,
             "candle_time": str(
                 m5_current["time"]
@@ -1261,13 +1288,11 @@ def analyse():
         m5_current["atr"]
     )
 
-    # Entry zone based on ATR instead of fixed $2
     entry_buffer = max(
         round(atr * 0.20, 2),
         0.50,
     )
 
-    # Stop buffer
     stop_buffer = max(
         round(atr * 0.25, 2),
         0.75,
@@ -1289,22 +1314,16 @@ def analyse():
         )
 
         stop_loss = round(
-            structural_stop
-            - stop_buffer,
+            structural_stop - stop_buffer,
             2,
         )
 
-        risk = (
-            entry_low
-            - stop_loss
-        )
+        risk = entry_low - stop_loss
 
         if risk <= 0:
             return {
                 "side": "WAIT",
-                "reason": (
-                    "Invalid BUY risk calculation"
-                ),
+                "reason": "Invalid BUY risk calculation",
                 "candle_time": str(
                     m5_current["time"]
                 ),
@@ -1316,7 +1335,7 @@ def analyse():
         )
 
         take_profit_2 = round(
-            entry_low + risk * 1.8,
+            entry_low + (risk * 1.8),
             2,
         )
 
@@ -1327,11 +1346,10 @@ def analyse():
         )
 
         why = (
-            "H1 is bullish, M15 agrees, "
-            "and M5 has produced a confirmed "
-            "bullish trigger. ADX is rising, "
-            "+DI controls direction, and ATR "
-            "shows sufficient movement."
+            "H1 is bullish, M15 agrees, and M5 "
+            "has produced a confirmed bullish trigger. "
+            "ADX and +DI support the move while ATR "
+            "shows acceptable volatility."
         )
 
         invalidation = (
@@ -1357,22 +1375,16 @@ def analyse():
         )
 
         stop_loss = round(
-            structural_stop
-            + stop_buffer,
+            structural_stop + stop_buffer,
             2,
         )
 
-        risk = (
-            stop_loss
-            - entry_high
-        )
+        risk = stop_loss - entry_high
 
         if risk <= 0:
             return {
                 "side": "WAIT",
-                "reason": (
-                    "Invalid SELL risk calculation"
-                ),
+                "reason": "Invalid SELL risk calculation",
                 "candle_time": str(
                     m5_current["time"]
                 ),
@@ -1384,7 +1396,7 @@ def analyse():
         )
 
         take_profit_2 = round(
-            entry_high - risk * 1.8,
+            entry_high - (risk * 1.8),
             2,
         )
 
@@ -1395,11 +1407,10 @@ def analyse():
         )
 
         why = (
-            "H1 is bearish, M15 agrees, "
-            "and M5 has produced a confirmed "
-            "bearish trigger. ADX is rising, "
-            "-DI controls direction, and ATR "
-            "shows sufficient movement."
+            "H1 is bearish, M15 agrees, and M5 "
+            "has produced a confirmed bearish trigger. "
+            "ADX and -DI support the move while ATR "
+            "shows acceptable volatility."
         )
 
         invalidation = (
@@ -1413,15 +1424,12 @@ def analyse():
         score
     )
 
-    lot_text = (
-        f"{lot:.2f} lot"
-    )
+    lot_text = f"{lot:.2f} lot"
 
     message = (
         f"{emoji} XAUUSD SIGNAL\n\n"
         f"Best Scenario\n"
-        f"{side} "
-        f"({grade} | Score {score}/6)\n\n"
+        f"{side} ({grade} | Score {score}/6)\n\n"
         f"Quality\n"
         f"{quality}\n\n"
         f"Momentum Strength\n"
@@ -1457,6 +1465,7 @@ def analyse():
         "h1_bias": higher_timeframe_bias,
         "momentum_strength": strength,
         "exhaustion_risk": exhaustion,
+        "confirmation": confirmation,
         "entry": entry_text,
         "stop_loss": stop_loss,
         "tp1": take_profit_1,
@@ -1477,39 +1486,30 @@ def should_send(signal):
     if not signal:
         return False
 
-    # Never send WAIT messages
+    # Do not send WAIT messages
     if signal.get("side") == "WAIT":
         return False
 
-    # Only Execution Grade
-    if (
-        signal.get("quality")
-        != "EXECUTION GRADE"
-    ):
+    # Execution Grade only
+    if signal.get("quality") != "EXECUTION GRADE":
         return False
 
     candle_time = signal.get(
         "candle_time"
     )
 
-    if (
-        candle_time
-        == state["last_candle_time"]
-    ):
+    # Prevent duplicate signal from same closed candle
+    if candle_time == state["last_candle_time"]:
         return False
 
     now = datetime.now(timezone.utc)
 
     if state["last_signal_time"]:
         elapsed_minutes = (
-            now
-            - state["last_signal_time"]
+            now - state["last_signal_time"]
         ).total_seconds() / 60
 
-        if (
-            elapsed_minutes
-            < SIGNAL_COOLDOWN_MINUTES
-        ):
+        if elapsed_minutes < SIGNAL_COOLDOWN_MINUTES:
             return False
 
     return True
@@ -1519,12 +1519,9 @@ def run_once():
     if is_weekend_sleep():
         return {
             "status": "SLEEPING",
-            "reason": (
-                "Weekend shutdown active"
-            ),
+            "reason": "Weekend shutdown active",
             "sleep_window": (
-                "Friday 22:00 "
-                "to Sunday 22:00"
+                "Friday 22:00 to Sunday 22:00"
             ),
             "timezone": SCOUT_TIMEZONE,
         }
@@ -1533,12 +1530,9 @@ def run_once():
         return {
             "status": "OFF_SESSION",
             "reason": (
-                "Outside approved "
-                "scouting windows"
+                "Outside approved scouting windows"
             ),
-            "scouting_windows": (
-                SCOUT_WINDOWS
-            ),
+            "scouting_windows": SCOUT_WINDOWS,
             "timezone": SCOUT_TIMEZONE,
         }
 
@@ -1562,10 +1556,12 @@ def run_once():
         )
 
         print(
-            f"Signal sent: "
-            f"{signal['side']} "
-            f"{signal['grade']} "
-            f"{signal['score']}/6",
+            (
+                f"Signal sent: "
+                f"{signal['side']} "
+                f"{signal['grade']} "
+                f"{signal['score']}/6"
+            ),
             flush=True,
         )
 
@@ -1577,8 +1573,7 @@ def run_once():
             "reason",
             (
                 "No Execution Grade signal, "
-                "duplicate candle, or "
-                "cooldown active"
+                "duplicate candle, or cooldown active"
             ),
         ),
         "analysis": signal,
@@ -1586,7 +1581,7 @@ def run_once():
 
 
 # ============================================================
-# BACKGROUND BOT LOOP
+# BACKGROUND LOOP
 # ============================================================
 
 def bot_loop():
@@ -1625,22 +1620,17 @@ def home():
         "symbol": SYMBOL,
         "uk_time": now.isoformat(),
         "strategy": (
-            "Strict H1 + M15 alignment, "
-            "M5 confirmation, ADX/DI, "
-            "ATR and exhaustion filters"
+            "H1 trend + M15 alignment + "
+            "M5 confirmation + ADX/DI + "
+            "ATR + exhaustion filter"
         ),
-        "scout_timezone": (
-            SCOUT_TIMEZONE
-        ),
-        "scout_windows": (
-            SCOUT_WINDOWS
-        ),
+        "scout_timezone": SCOUT_TIMEZONE,
+        "scout_windows": SCOUT_WINDOWS,
         "currently_scouting": (
             is_within_scouting_time()
         ),
         "weekend_sleep": (
-            "Friday 22:00 "
-            "to Sunday 22:00"
+            "Friday 22:00 to Sunday 22:00"
         ),
         "sleeping_now": (
             is_weekend_sleep()
@@ -1648,12 +1638,8 @@ def home():
         "cooldown_minutes": (
             SIGNAL_COOLDOWN_MINUTES
         ),
-        "minimum_score": (
-            MIN_SIGNAL_SCORE
-        ),
-        "minimum_adx": (
-            MIN_ADX
-        ),
+        "minimum_score": MIN_SIGNAL_SCORE,
+        "minimum_adx": MIN_ADX,
         "telegram_policy": (
             "Execution Grade only"
         ),
@@ -1686,15 +1672,13 @@ def test_telegram():
 def health():
     return jsonify({
         "status": "healthy",
-        "timestamp": (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        ),
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),
     })
 
 
-# Start one background loop.
+# Start one background loop
 threading.Thread(
     target=bot_loop,
     daemon=True,
